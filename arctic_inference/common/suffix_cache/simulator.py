@@ -66,7 +66,7 @@ def suffix_decode(
         max_spec_tokens = suffix_cache.max_depth
 
     if use_cached_prompt:
-        suffix_cache.cache_prompt(request_id, prompt)
+        suffix_cache.cache_prompt(request_id, prompt, problem_id)
 
     assert isinstance(prompt, list) and isinstance(ground_truth_response, list)
 
@@ -261,7 +261,7 @@ def process_task(
         # Use negative request_id to indicate training examples and avoid
         # conflicts with eval request_ids numbered 0, .., num_eval - 1.
         # Use the real problem_id from data
-        problem_id = example["problem_id"]
+        problem_id = "0"
         suffix_cache.update_response(-1 - request_id, problem_id, example["prompt"])
         suffix_cache.update_response(-1 - request_id, problem_id, example["response"])
 
@@ -324,7 +324,8 @@ def process_task(
                                     total=len(eval_subset),
                                     desc=f"Running requests"):
         # Use the real problem_id from data
-        problem_id = example["problem_id"]
+        #problem_id = example["problem_id"]
+        problem_id = "0"
         results = suffix_decode(
             suffix_cache,
             request_id,
@@ -530,14 +531,14 @@ def main(args: argparse.Namespace):
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
         
     # # Tokenize datasets (if needed)
-    # if args.tokenizer is not None:
-    #     dataset = tokenize_data(dataset, args.tokenizer)
-    #     if train_dataset is not None:
-    #         train_dataset = tokenize_data(train_dataset, args.tokenizer)
-    # else:
-    #     ensure_tokenized(dataset)
-    #     if train_dataset is not None:
-    #         ensure_tokenized(train_dataset)
+    if args.tokenizer is not None:
+        dataset = tokenize_data(dataset, args.tokenizer)
+        if train_dataset is not None:
+            train_dataset = tokenize_data(train_dataset, args.tokenizer)
+    else:
+        ensure_tokenized(dataset)
+        if train_dataset is not None:
+            ensure_tokenized(train_dataset)
     # Create all possible configurations
     num_eval = args.num_eval or [None]
     num_train = args.num_train or [None]
@@ -634,13 +635,13 @@ def get_parser():
     parser.add_argument(
         "--prompt-column",
         type=str,
-        default="input_token_ids",
+        default="input",
         help="Column name for the prompts in the dataset",
     )
     parser.add_argument(
         "--response-column",
         type=str,
-        default="output_token_ids",
+        default="output",
         help="Column name for the responses in the dataset",
     )
     parser.add_argument(
@@ -714,7 +715,7 @@ def get_parser():
         "--use-tree-spec",
         type=bool_arg,
         nargs="*",
-        default=[False],
+        default=[True],
         help="Whether to use tree-based speculation (True/False)",
     )
     parser.add_argument(

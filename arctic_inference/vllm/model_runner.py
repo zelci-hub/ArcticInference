@@ -64,7 +64,9 @@ HARD_PROBLEMS = {
     "prob_0056", "prob_0095", "prob_0077", "prob_0051", "prob_0067",
     "prob_0061", "prob_0019", "prob_0002", "prob_0026", "prob_0055",
     "prob_0074", "prob_0031", "prob_0012", "prob_0034", "prob_0010",
-    "prob_0024", "prob_0046", "prob_0081", "prob_0064", "prob_0090"
+    "prob_0024", "prob_0046", "prob_0081", "prob_0064", "prob_0090",
+    "prob_0027", "prob_0035", "prob_0082", "prob_0092", "prob_0043",
+    "prob_0084", "prob_0098", "prob_0068", "prob_0096", "prob_0083"
 }
 
 # Configuration for hard problems only suffix decoding
@@ -731,7 +733,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             valid_sampled_token_ids[i].clear()
 
         ### profiling suffix_tree_stats: now may have bug 
-        self._log_suffix_tree_stats(num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
+        #self._log_suffix_tree_stats(num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
 
         #print(f"DEBUG: sampled_token_ids: {sampled_token_ids}")
             
@@ -777,6 +779,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # Speculative decoding is not enabled.
             spec_token_ids = None
         else:
+            # problem: propose too much token & sequentially, too much time
             spec_token_ids = self.propose_draft_token_ids(
                 scheduler_output,
                 valid_sampled_token_ids,
@@ -789,120 +792,124 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 attn_metadata,
             )
             
-            # # # # # 统计和控制 spec_token 数量
-            # if spec_token_ids is not None:
-            #     # 统计总的 spec_token 数量
-            #     total_spec_tokens = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
+            # # # # # # 统计和控制 spec_token 数量
+            if spec_token_ids is not None:
+                # 统计总的 spec_token 数量
+                total_spec_tokens = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
                 
-            #     # 如果数量超过128，按比例删除一部分
-            #     if total_spec_tokens > 200:
-            #         # 计算需要保留的比例
-            #         keep_ratio = 200 / total_spec_tokens
+                # 如果数量超过128，按比例删除一部分
+                if total_spec_tokens > 200:
+                    # 计算需要保留的比例
+                    keep_ratio = 200 / total_spec_tokens
                     
-            #         # 对每个子列表按比例保留 tokens
-            #         filtered_spec_token_ids = []
-            #         for tokens in spec_token_ids:
-            #             if tokens is not None and len(tokens) > 0:
-            #                 # 计算当前子列表需要保留的数量
-            #                 keep_count = max(1, int(len(tokens) * keep_ratio))  # 至少保留1个
-            #                 # 保留前 keep_count 个 tokens
-            #                 filtered_tokens = tokens[:keep_count]
-            #                 filtered_spec_token_ids.append(filtered_tokens)
-            #             else:
-            #                 filtered_spec_token_ids.append(tokens)
+                    # 对每个子列表按比例保留 tokens
+                    filtered_spec_token_ids = []
+                    for tokens in spec_token_ids:
+                        if tokens is not None and len(tokens) > 0:
+                            # 计算当前子列表需要保留的数量
+                            keep_count = max(1, int(len(tokens) * keep_ratio))  # 至少保留1个
+                            # 保留前 keep_count 个 tokens
+                            filtered_tokens = tokens[:keep_count]
+                            filtered_spec_token_ids.append(filtered_tokens)
+                        else:
+                            filtered_spec_token_ids.append(tokens)
                     
-            #         spec_token_ids = filtered_spec_token_ids
+                    spec_token_ids = filtered_spec_token_ids
                     
                    # 记录统计信息（可选）
                     # filtered_total = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
                     # print(f"Spec tokens reduced: {total_spec_tokens} -> {filtered_total} (ratio: {keep_ratio:.3f})")
-        # execution_end_time = time.perf_counter()
-        # execution_duration = execution_end_time - execution_start_time
-        # self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
-        #                         scheduler_output.total_num_scheduled_tokens, early_return=False)
+            total_proposed = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
+            # execution_end_time = time.perf_counter()
+            # execution_duration = execution_end_time - execution_start_time
+            # self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
+            #                     total_proposed, early_return=False)
+            # self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
+            #                     scheduler_output.total_num_scheduled_tokens, early_return=False)
 
-                    # # # # 统计和控制 spec_token 数量
-            if spec_token_ids is not None:
-                # 分类请求：HARD_PROBLEMS vs 非HARD_PROBLEMS
-                hard_indices = []
-                non_hard_indices = []
+
+                    # # # 统计和控制 spec_token 数量
+            # if spec_token_ids is not None:
+            #     # 分类请求：HARD_PROBLEMS vs 非HARD_PROBLEMS
+            #     hard_indices = []
+            #     non_hard_indices = []
                 
-                for i, req_id in enumerate(self.input_batch.req_ids):
-                    problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
-                    if str(problem_id) in HARD_PROBLEMS:
-                        hard_indices.append(i)
-                    else:
-                        non_hard_indices.append(i)
+            #     for i, req_id in enumerate(self.input_batch.req_ids):
+            #         problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
+            #         if str(problem_id) in HARD_PROBLEMS:
+            #             hard_indices.append(i)
+            #         else:
+            #             non_hard_indices.append(i)
                 
-                # 统计HARD_PROBLEMS的spec_tokens数量
-                hard_spec_tokens = 0
-                for i in hard_indices:
-                    if i < len(spec_token_ids) and spec_token_ids[i] is not None:
-                        hard_spec_tokens += len(spec_token_ids[i])
+            #     # 统计HARD_PROBLEMS的spec_tokens数量
+            #     hard_spec_tokens = 0
+            #     for i in hard_indices:
+            #         if i < len(spec_token_ids) and spec_token_ids[i] is not None:
+            #             hard_spec_tokens += len(spec_token_ids[i])
                 
-                # 根据HARD_PROBLEMS的tokens数量决定策略
-                if hard_spec_tokens > 160:
-                    # 策略1: HARD_PROBLEMS超过200，按比例削减HARD_PROBLEMS，删除所有非HARD_PROBLEMS
-                    keep_ratio = 160 / hard_spec_tokens
+            #     # 根据HARD_PROBLEMS的tokens数量决定策略
+            #     if hard_spec_tokens > 200:
+            #         # 策略1: HARD_PROBLEMS超过200，按比例削减HARD_PROBLEMS，删除所有非HARD_PROBLEMS
+            #         keep_ratio = 200 / hard_spec_tokens
                     
-                    filtered_spec_token_ids = []
-                    for i in range(len(spec_token_ids)):
-                        if i in hard_indices:
-                            # HARD_PROBLEMS请求：按比例削减
-                            if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
-                                keep_count = max(1, int(len(spec_token_ids[i]) * keep_ratio))
-                                filtered_tokens = spec_token_ids[i][:keep_count]
-                                filtered_spec_token_ids.append(filtered_tokens)
-                            else:
-                                filtered_spec_token_ids.append(spec_token_ids[i])
-                        else:
-                            # 非HARD_PROBLEMS请求：删除所有spec_tokens
-                            filtered_spec_token_ids.append([])
+            #         filtered_spec_token_ids = []
+            #         for i in range(len(spec_token_ids)):
+            #             if i in hard_indices:
+            #                 # HARD_PROBLEMS请求：按比例削减
+            #                 if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
+            #                     keep_count = max(1, int(len(spec_token_ids[i]) * keep_ratio))
+            #                     filtered_tokens = spec_token_ids[i][:keep_count]
+            #                     filtered_spec_token_ids.append(filtered_tokens)
+            #                 else:
+            #                     filtered_spec_token_ids.append(spec_token_ids[i])
+            #             else:
+            #                 # 非HARD_PROBLEMS请求：删除所有spec_tokens
+            #                 filtered_spec_token_ids.append([])
                     
-                    spec_token_ids = filtered_spec_token_ids
+            #         spec_token_ids = filtered_spec_token_ids
                     
-                else:
-                    # 策略2: HARD_PROBLEMS未超过200，保持HARD_PROBLEMS不变，给非HARD_PROBLEMS分配剩余配额
-                    remaining_quota = 160 - hard_spec_tokens
+            #     else:
+            #         # 策略2: HARD_PROBLEMS未超过200，保持HARD_PROBLEMS不变，给非HARD_PROBLEMS分配剩余配额
+            #         remaining_quota = 200 - hard_spec_tokens
                     
-                    # 统计非HARD_PROBLEMS的原始tokens数量
-                    non_hard_spec_tokens = 0
-                    for i in non_hard_indices:
-                        if i < len(spec_token_ids) and spec_token_ids[i] is not None:
-                            non_hard_spec_tokens += len(spec_token_ids[i])
+            #         # 统计非HARD_PROBLEMS的原始tokens数量
+            #         non_hard_spec_tokens = 0
+            #         for i in non_hard_indices:
+            #             if i < len(spec_token_ids) and spec_token_ids[i] is not None:
+            #                 non_hard_spec_tokens += len(spec_token_ids[i])
                     
-                    if non_hard_spec_tokens > 0 and remaining_quota > 0:
-                        # 计算非HARD_PROBLEMS的缩放比例
-                        non_hard_ratio = min(1.0, remaining_quota / non_hard_spec_tokens)
+            #         if non_hard_spec_tokens > 0 and remaining_quota > 0:
+            #             # 计算非HARD_PROBLEMS的缩放比例
+            #             non_hard_ratio = min(1.0, remaining_quota / non_hard_spec_tokens)
                         
-                        filtered_spec_token_ids = []
-                        for i in range(len(spec_token_ids)):
-                            if i in hard_indices:
-                                # HARD_PROBLEMS请求：保持不变
-                                filtered_spec_token_ids.append(spec_token_ids[i])
-                            else:
-                                # 非HARD_PROBLEMS请求：按比例缩放
-                                if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
-                                    keep_count = max(0, int(len(spec_token_ids[i]) * non_hard_ratio))
-                                    if keep_count > 0:
-                                        filtered_tokens = spec_token_ids[i][:keep_count]
-                                        filtered_spec_token_ids.append(filtered_tokens)
-                                    else:
-                                        filtered_spec_token_ids.append([])
-                                else:
-                                    filtered_spec_token_ids.append(spec_token_ids[i])
+            #             filtered_spec_token_ids = []
+            #             for i in range(len(spec_token_ids)):
+            #                 if i in hard_indices:
+            #                     # HARD_PROBLEMS请求：保持不变
+            #                     filtered_spec_token_ids.append(spec_token_ids[i])
+            #                 else:
+            #                     # 非HARD_PROBLEMS请求：按比例缩放
+            #                     if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
+            #                         keep_count = max(0, int(len(spec_token_ids[i]) * non_hard_ratio))
+            #                         if keep_count > 0:
+            #                             filtered_tokens = spec_token_ids[i][:keep_count]
+            #                             filtered_spec_token_ids.append(filtered_tokens)
+            #                         else:
+            #                             filtered_spec_token_ids.append([])
+            #                     else:
+            #                         filtered_spec_token_ids.append(spec_token_ids[i])
                         
-                        spec_token_ids = filtered_spec_token_ids
-                    elif remaining_quota <= 0:
-                        # 剩余配额不足，删除所有非HARD_PROBLEMS的spec_tokens
-                        filtered_spec_token_ids = []
-                        for i in range(len(spec_token_ids)):
-                            if i in hard_indices:
-                                filtered_spec_token_ids.append(spec_token_ids[i])
-                            else:
-                                filtered_spec_token_ids.append([])
+            #             spec_token_ids = filtered_spec_token_ids
+            #         elif remaining_quota <= 0:
+            #             # 剩余配额不足，删除所有非HARD_PROBLEMS的spec_tokens
+            #             filtered_spec_token_ids = []
+            #             for i in range(len(spec_token_ids)):
+            #                 if i in hard_indices:
+            #                     filtered_spec_token_ids.append(spec_token_ids[i])
+            #                 else:
+            #                     filtered_spec_token_ids.append([])
                         
-                        spec_token_ids = filtered_spec_token_ids
+            #             spec_token_ids = filtered_spec_token_ids
 
         # Clear KVConnector state after all KVs are generated.
         if has_kv_transfer_group():
@@ -1183,13 +1190,129 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         #             pass
 
 
+    def _process_single_speculation(self, args):
+        """Process a single speculation request for parallel execution"""
+        (i, sampled_ids, spec_ids, config) = args
+        
+        num_sampled_ids = len(sampled_ids)
+        if not num_sampled_ids:
+            # Skip speculative decoding.
+            return SuffixSpecResult()
+
+        req_id = self.input_batch.req_ids[i]
+        problem_id = self.get_problem_id_by_request_id(req_id)  # Method 1: Direct lookup
+        if problem_id is None:
+            print(f"problem_id is None for req_id={req_id}")
+
+        # Add sampled_token_ids to token_ids_cpu.
+        end_idx = self.input_batch.num_tokens_no_spec[i]
+        # end_idx = start_idx + len(sampled_ids)
+
+        if end_idx >= self.max_model_len:
+            return SuffixSpecResult()
+
+        # Check what's already at the position before writing
+        # existing_token = self.input_batch.token_ids_cpu[i, start_idx-6:start_idx].tolist() if start_idx < self.input_batch.token_ids_cpu.shape[1] else []
+        # print(f"DEBUG:start_idx: {start_idx}, end_idx: {end_idx}")
+        # print(f"DEBUG:existing_token: {existing_token}, sampled_ids: {sampled_ids}")
+        
+        # self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
+
+        size = min(end_idx, config.suffix_cache_max_depth)
+        pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx]
+        pattern = pattern.tolist() + spec_ids
+        if len(pattern) > config.suffix_cache_max_depth:
+            pattern = pattern[-config.suffix_cache_max_depth:]
+        max_spec_tokens = min(MAX_SPEC_LEN - len(spec_ids),
+                              config.suffix_cache_max_depth,
+                              self.max_model_len - end_idx - 1)
+        # max_spec_offset is modified to mimic the behavior of the original
+        # max_spec_factor and max_spec_offset as if the speculative tokens
+        # were generated by suffix decoding. For example, if:
+        #   - max_spec_factor = 2
+        #   - max_spec_offset = -1
+        #   - we've already speculated 3 tokens
+        #   - and the suffix match length is 6
+        # Then:
+        #   - The match length before the already-speculated tokens is 3
+        #   - The original config allow up to 5 speculated tokens total
+        #   - Already speculated 3 tokens, so should allow 2 more tokens
+        # So the new config should map match length 6 to 2 max spec tokens.
+        max_spec_factor = config.suffix_max_spec_factor
+        max_spec_offset = (config.suffix_max_spec_offset - len(spec_ids) *
+                           (max_spec_factor + 1))
+        result = self._suffix_cache.speculate(
+            req_id,
+            problem_id,
+            pattern,
+            max_spec_tokens=max_spec_tokens,
+            max_spec_factor=max_spec_factor,
+            max_spec_offset=max_spec_offset,
+            min_token_prob=config.suffix_min_token_prob)
+
+        # # Debug output - capture match and spec token information
+        # if hasattr(self, '_debug_spec_file') and self._debug_spec_file:
+        #     self._step_counter += 1
+        #     
+        #     # Extract match tokens from pattern based on match length
+        #     match_tokens = pattern[-result.match_len:] if result.match_len > 0 else []
+        #     match_text = ""
+        #     if self._tokenizer and match_tokens:
+        #         try:
+        #             match_text = self._tokenizer.decode(match_tokens, skip_special_tokens=True)
+        #         except:
+        #             match_text = ""
+        #     
+        #     # Spec tokens from result
+        #     spec_tokens = result.token_ids if hasattr(result, 'token_ids') else []
+        #     spec_text = ""
+        #     if self._tokenizer and spec_tokens:
+        #         try:
+        #             spec_text = self._tokenizer.decode(spec_tokens, skip_special_tokens=True)
+        #         except:
+        #             spec_text = ""
+        #     
+        #     # Pattern tokens (the search pattern used)
+        #     pattern_text = ""
+        #     if self._tokenizer and pattern:
+        #         try:
+        #             pattern_text = self._tokenizer.decode(pattern, skip_special_tokens=True)
+        #         except:
+        #             pattern_text = ""
+        #     
+        #     # Create debug data similar to simulator
+        #     debug_data = {
+        #         "request_id": req_id,
+        #         "step": self._step_counter,
+        #         "batch_index": i,
+        #         "pattern": pattern,
+        #         "pattern_text": pattern_text,
+        #         "pattern_length": len(pattern),
+        #         "match_tokens": match_tokens,
+        #         "match_text": match_text,
+        #         "match_length": result.match_len,
+        #         "spec_tokens": spec_tokens,
+        #         "spec_text": spec_text,
+        #         "num_spec_tokens": len(spec_tokens),
+        #         "sampled_tokens": sampled_ids,
+        #         "existing_spec_tokens": spec_ids,
+        #         "score": getattr(result, 'score', 0.0),
+        #         "max_spec_tokens": max_spec_tokens,
+        #         "max_spec_factor": max_spec_factor,
+        #         "max_spec_offset": max_spec_offset
+        #     }
+        #     
+        #     self._debug_spec_file.write(json.dumps(debug_data, ensure_ascii=False) + '\n')
+        #     self._debug_spec_file.flush()
+
+        return result
+
     def propose_suffix_draft_token_ids(
         self,
         sampled_token_ids: list[list[int]],
         spec_token_ids: Optional[list[list[int]]] = None,
     ) -> list[list[int]]:
         config = self.speculative_config
-        results = []
         
         # # Initialize debug file for this rank if not already done
         # if not hasattr(self, '_debug_spec_file'):
@@ -1201,128 +1324,34 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         #     self._debug_spec_file = open(debug_file_path, 'w', encoding='utf-8')
         #     self._step_counter = 0
         
+        # Prepare arguments for parallel processing
+        batch_args = []
         for i, sampled_ids in enumerate(sampled_token_ids):
             spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
-            num_sampled_ids = len(sampled_ids)
-            if not num_sampled_ids:
-                # Skip speculative decoding.
-                results.append(SuffixSpecResult())
-                continue
-
-            req_id = self.input_batch.req_ids[i]
-            problem_id = self.get_problem_id_by_request_id(req_id)  # Method 1: Direct lookup
-            if problem_id is None:
-                print(f"problem_id is None for req_id={req_id}")
-
-            # Add sampled_token_ids to token_ids_cpu.
-            end_idx = self.input_batch.num_tokens_no_spec[i]
-            # end_idx = start_idx + len(sampled_ids)
-
-            if end_idx >= self.max_model_len:
-                results.append(SuffixSpecResult())
-                # self.input_batch.token_ids_cpu[
-                #     i, start_idx:self.
-                #     max_model_len] = sampled_ids[:self.max_model_len -
-                #                                  start_idx]
-                continue
-
-            # Check what's already at the position before writing
-            # existing_token = self.input_batch.token_ids_cpu[i, start_idx-6:start_idx].tolist() if start_idx < self.input_batch.token_ids_cpu.shape[1] else []
-            # print(f"DEBUG:start_idx: {start_idx}, end_idx: {end_idx}")
-            # print(f"DEBUG:existing_token: {existing_token}, sampled_ids: {sampled_ids}")
+            batch_args.append((i, sampled_ids, spec_ids, config))
+        
+        # Use ThreadPoolExecutor for parallel processing
+        # The number of workers is automatically determined by the SuffixCache's thread configuration
+        max_workers = min(len(batch_args), getattr(self._suffix_cache, '_max_threads', 4))
+        
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            # Submit all tasks and maintain order using list comprehension
+            future_to_index = {executor.submit(self._process_single_speculation, args): i 
+                             for i, args in enumerate(batch_args)}
             
-            # self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
-
-            size = min(end_idx, config.suffix_cache_max_depth)
-            pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx]
-            pattern = pattern.tolist() + spec_ids
-            if len(pattern) > config.suffix_cache_max_depth:
-                pattern = pattern[-config.suffix_cache_max_depth:]
-            max_spec_tokens = min(MAX_SPEC_LEN - len(spec_ids),
-                                  config.suffix_cache_max_depth,
-                                  self.max_model_len - end_idx - 1)
-            # max_spec_offset is modified to mimic the behavior of the original
-            # max_spec_factor and max_spec_offset as if the speculative tokens
-            # were generated by suffix decoding. For example, if:
-            #   - max_spec_factor = 2
-            #   - max_spec_offset = -1
-            #   - we've already speculated 3 tokens
-            #   - and the suffix match length is 6
-            # Then:
-            #   - The match length before the already-speculated tokens is 3
-            #   - The original config allow up to 5 speculated tokens total
-            #   - Already speculated 3 tokens, so should allow 2 more tokens
-            # So the new config should map match length 6 to 2 max spec tokens.
-            max_spec_factor = config.suffix_max_spec_factor
-            max_spec_offset = (config.suffix_max_spec_offset - len(spec_ids) *
-                               (max_spec_factor + 1))
-            result = self._suffix_cache.speculate(
-                req_id,
-                problem_id,
-                pattern,
-                max_spec_tokens=max_spec_tokens,
-                max_spec_factor=max_spec_factor,
-                max_spec_offset=max_spec_offset,
-                min_token_prob=config.suffix_min_token_prob)
-
-            # # Debug output - capture match and spec token information
-            # if hasattr(self, '_debug_spec_file') and self._debug_spec_file:
-            #     self._step_counter += 1
-            #     
-            #     # Extract match tokens from pattern based on match length
-            #     match_tokens = pattern[-result.match_len:] if result.match_len > 0 else []
-            #     match_text = ""
-            #     if self._tokenizer and match_tokens:
-            #         try:
-            #             match_text = self._tokenizer.decode(match_tokens, skip_special_tokens=True)
-            #         except:
-            #             match_text = ""
-            #     
-            #     # Spec tokens from result
-            #     spec_tokens = result.token_ids if hasattr(result, 'token_ids') else []
-            #     spec_text = ""
-            #     if self._tokenizer and spec_tokens:
-            #         try:
-            #             spec_text = self._tokenizer.decode(spec_tokens, skip_special_tokens=True)
-            #         except:
-            #             spec_text = ""
-            #     
-            #     # Pattern tokens (the search pattern used)
-            #     pattern_text = ""
-            #     if self._tokenizer and pattern:
-            #         try:
-            #             pattern_text = self._tokenizer.decode(pattern, skip_special_tokens=True)
-            #         except:
-            #             pattern_text = ""
-            #     
-            #     # Create debug data similar to simulator
-            #     debug_data = {
-            #         "request_id": req_id,
-            #         "step": self._step_counter,
-            #         "batch_index": i,
-            #         "pattern": pattern,
-            #         "pattern_text": pattern_text,
-            #         "pattern_length": len(pattern),
-            #         "match_tokens": match_tokens,
-            #         "match_text": match_text,
-            #         "match_length": result.match_len,
-            #         "spec_tokens": spec_tokens,
-            #         "spec_text": spec_text,
-            #         "num_spec_tokens": len(spec_tokens),
-            #         "sampled_tokens": sampled_ids,
-            #         "existing_spec_tokens": spec_ids,
-            #         "score": getattr(result, 'score', 0.0),
-            #         "max_spec_tokens": max_spec_tokens,
-            #         "max_spec_factor": max_spec_factor,
-            #         "max_spec_offset": max_spec_offset
-            #     }
-            #     
-            #     self._debug_spec_file.write(json.dumps(debug_data, ensure_ascii=False) + '\n')
-            #     self._debug_spec_file.flush()
-
-            results.append(result)
+            # Collect results in order
+            results = [None] * len(batch_args)
+            for future in future_to_index:
+                index = future_to_index[future]
+                try:
+                    results[index] = future.result()
+                except Exception as e:
+                    print(f"Error processing speculation for index {index}: {e}")
+                    results[index] = SuffixSpecResult()  # Fallback to empty result
 
         return results
+
+
 
     def __del__(self):
         """Clean up debug files when model runner is destroyed"""
@@ -1537,6 +1566,20 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         per_request_stats = []
 
         if num_draft_tokens is None:
+            # Still need to populate per_request_stats with req_id and problem_id info
+            for req_id in self.input_batch.req_ids:
+                # Get problem_id for this request
+                problem_id = None
+                if hasattr(self, '_current_batch_req_id_to_problem_id'):
+                    problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
+                
+                per_request_stats.append({
+                    "req_id": req_id,
+                    "problem_id": problem_id,
+                    "proposed": 0,
+                    "accepted": 0
+                })
+            
             proposed_count = 0
             accepted_count = 0
             stats_data = {
@@ -1569,9 +1612,15 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             total_proposed += proposed_count
             total_accepted += accepted_count
          
+            # Get problem_id for this request
+            problem_id = None
+            if hasattr(self, '_current_batch_req_id_to_problem_id'):
+                problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
+         
             # Record per-request stats
             per_request_stats.append({
                 "req_id": req_id,
+                "problem_id": problem_id,
                 "proposed": proposed_count,
                 "accepted": accepted_count
             })

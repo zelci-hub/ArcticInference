@@ -77,7 +77,13 @@ class SuffixCache:
         """
         self._max_depth = max_depth
         self._thread_safe = thread_safe
-        self._max_threads = max_threads or min(8, threading.active_count() + 4)
+        # 🎯 SuffixCache线程数配置：硬编码为10线程
+        if max_threads is None:
+            self._max_threads = 10
+            print(f"🎯 SuffixCache使用硬编码线程数: {self._max_threads}")
+        else:
+            self._max_threads = max_threads
+            print(f"🎯 SuffixCache使用指定线程数: {max_threads}")
         
         #self._suffix_tree = SuffixTree(max_depth)
         self._problem_tree = {}
@@ -99,7 +105,7 @@ class SuffixCache:
     def cached_prompt_ids(self) -> List[Hashable]:
         return list(self._prompt_trees.keys())
 
-    def cache_prompt(self, req_id: Hashable, prompt_token_ids: Sequence[int]):
+    def cache_prompt(self, req_id: Hashable, prompt_token_ids: Sequence[int], problem_id: Optional[Hashable] = None):
         """
         Cache a prompt for a specific request ID. Future speculations for the
         same request may also source draft tokens from this prompt.
@@ -137,6 +143,22 @@ class SuffixCache:
             tree.extend_safe(0, prompt_token_ids)
         else:
             tree.extend(0, prompt_token_ids)
+
+        # Optionally also cache the prompt into the corresponding problem tree
+        if problem_id is not None:
+            # Ensure problem tree exists
+            if problem_id not in self._problem_tree:
+                if self._dict_lock:
+                    with self._dict_lock:
+                        if problem_id not in self._problem_tree:
+                            self._problem_tree[problem_id] = SuffixTree(self._max_depth)
+                else:
+                    self._problem_tree[problem_id] = SuffixTree(self._max_depth)
+            problem_tree = self._problem_tree[problem_id]
+            if self._thread_safe:
+                problem_tree.extend_safe(0, prompt_token_ids)
+            else:
+                problem_tree.extend(0, prompt_token_ids)
 
     def evict_prompt(self, req_id: Hashable):
         """
@@ -325,20 +347,20 @@ class SuffixCache:
         """
         if use_cached_prompt and req_id not in self._prompt_trees:
             raise ValueError(f"Prompt does not exist for request '{req_id}'")
-        if problem_id not in self._problem_tree:
-            raise ValueError(f"Prompt does not exist for request '{problem_id}'")
+        # if problem_id not in self._problem_tree:
+        #     raise ValueError(f"Prompt does not exist for problem '{problem_id}'")
         if not pattern:
             raise ValueError("Pattern must not be empty")
 
 
         if max_spec_tokens is None:
             max_spec_tokens = self.max_depth
-        #max_spec_offset = -1
+        #max_spec_tokens = 8
 
         if len(pattern) > self._max_depth:
             pattern = pattern[-self._max_depth :]
         
-
+        result = SuffixSpecResult()        
         if use_cached_prompt:
             prompt_tree = self._prompt_trees[req_id]
             # Use thread-safe speculate if available (though speculate is typically read-only)
@@ -354,14 +376,18 @@ class SuffixCache:
             result = SuffixSpecResult()
 
         # Thread-safe access to problem tree (no need for _safe method as speculate is read-only)
-        problem_tree = self._problem_tree[problem_id]
-        candidate = problem_tree.speculate(
-            pattern,
-            max_spec_tokens,
-            max_spec_factor,
-            max_spec_offset,
-            min_token_prob,
-            use_tree_spec)
+        if problem_id in self._problem_tree:
+            problem_tree = self._problem_tree[problem_id]
+            candidate = problem_tree.speculate(
+                pattern,
+                max_spec_tokens,
+                max_spec_factor,
+                max_spec_offset,
+                min_token_prob,
+                use_tree_spec)
+        else:
+            candidate = SuffixSpecResult()
+
         if candidate.score > result.score:
             result = SuffixSpecResult.from_candidate(candidate)
         return result
