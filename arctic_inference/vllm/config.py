@@ -61,6 +61,10 @@ class ArcticSpeculativeConfig(SpeculativeConfig):
     suffix_max_spec_factor: float = 1.0
     suffix_max_spec_offset: float = 0.0
     suffix_min_token_prob: float = 0.1
+    num_speculative_tokens: int = 64
+    # Custom Arctic toggles used by model_runner for runtime heuristics
+    confidence_based_only: bool = False
+    distribution_aware: bool = False
     # Optional bootstrap data to seed the suffix cache when the engine starts.
     # Provide a list of token-id sequences; each sequence will be inserted as a
     # separate historical response stream so newly created engines can reuse

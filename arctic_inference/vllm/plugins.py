@@ -34,6 +34,25 @@ from arctic_inference.vllm.ulysses import apply_shift_parallel_patches
 logger = init_logger(__name__)
 
 
+def apply_minimal_attention_patch():
+    """Apply a minimal patch to handle layer_idx and dual_chunk_attention_config parameters
+    when Ulysses is disabled, to maintain compatibility with Qwen2 models."""
+    from vllm.attention.layer import Attention
+    
+    # Store the original __init__ method
+    _orig_init = Attention.__init__
+    
+    def patched_init(self, *args, **kwargs):
+        # Remove parameters that the original Attention.__init__ doesn't accept
+        kwargs.pop("layer_idx", None)
+        kwargs.pop("dual_chunk_attention_config", None)
+        return _orig_init(self, *args, **kwargs)
+    
+    # Apply the patch
+    Attention.__init__ = patched_init
+    logger.info("Applied minimal attention patch to handle layer_idx and dual_chunk_attention_config parameters")
+
+
 class EngineCoreProcPatch(ArcticPatch[EngineCoreProc]):
 
     _orig_run_engine_core = EngineCoreProc.run_engine_core
@@ -127,4 +146,13 @@ def arctic_inference_plugin():
     MLPSpeculatorConfigPatch.apply_patch()
 
     # Main optimization patches.
-    apply_shift_parallel_patches()
+    # Check if Ulysses/shift parallel patches should be disabled
+    disable_ulysses = os.getenv("ARCTIC_DISABLE_ULYSSES", "0") == "1"
+    if disable_ulysses:
+        logger.info("Ulysses sequence parallelism patches disabled by ARCTIC_DISABLE_ULYSSES=1")
+        # Apply a minimal patch to handle layer_idx and dual_chunk_attention_config parameters
+        # even when Ulysses is disabled, to maintain compatibility with Qwen2 models
+        apply_minimal_attention_patch()
+    else:
+        apply_shift_parallel_patches()
+        apply_minimal_attention_patch()

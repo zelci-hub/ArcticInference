@@ -429,9 +429,18 @@ class UlyssesAttentionPatch(ArcticPatch[Attention]):
 
     def __init__(self, num_heads, *args, **kwargs):
         from .model_runner import is_shift_parallel_mode
-        self.sp_size = parallel_state._SP.world_size
-        self.sp_device_group = parallel_state._SP.device_group
-        if not is_shift_parallel_mode():
+        
+        # Check if Ulysses parallel state is initialized
+        if parallel_state._SP is not None:
+            self.sp_size = parallel_state._SP.world_size
+            self.sp_device_group = parallel_state._SP.device_group
+        else:
+            # If parallel state is not initialized, default to no sequence parallelism
+            self.sp_size = 1
+            self.sp_device_group = None
+        
+        # Skip Ulysses logic if sequence parallel size is 1 (disabled)
+        if self.sp_size > 1 and not is_shift_parallel_mode():
             num_heads //= self.sp_size
             num_kv_heads = kwargs["num_kv_heads"]
             self.is_kv_replicated = True if num_kv_heads < self.sp_size else False
@@ -450,6 +459,13 @@ class UlyssesAttentionPatch(ArcticPatch[Attention]):
             else:
                 num_kv_heads //= self.sp_size
             kwargs["num_kv_heads"] = num_kv_heads
+        
+        # Remove parameters that FlashAttentionImpl doesn't accept
+        # Note: This may affect models that use DualChunkFlashAttentionImpl, but it's necessary
+        # to prevent "unexpected keyword argument" errors
+        kwargs.pop("layer_idx", None)
+        kwargs.pop("dual_chunk_attention_config", None)
+        
         return self._orig_init(num_heads, *args, **kwargs)
 
     def forward(self, query, key, value, **kwargs):

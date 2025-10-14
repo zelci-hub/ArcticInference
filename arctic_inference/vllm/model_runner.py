@@ -59,32 +59,6 @@ from arctic_inference.common.suffix_cache import SuffixSpecResult
 
 SP_TP_MODE = None
 
-# Hard problems list for suffix tree decoding.   (10,12)()()()()
-HARD_PROBLEMS = {
-    "prob_0056", "prob_0095", "prob_0077", "prob_0051", "prob_0067",
-    "prob_0061", "prob_0019", "prob_0002", "prob_0026", "prob_0055",
-    "prob_0074", "prob_0031", "prob_0012", "prob_0034", "prob_0010",
-    "prob_0024", "prob_0046", "prob_0081", "prob_0064", "prob_0090",
-    "prob_0027", "prob_0035", "prob_0082", "prob_0092", "prob_0043",
-    "prob_0084", "prob_0098", "prob_0068", "prob_0096", "prob_0083"
-}
-
-# Configuration for hard problems only suffix decoding
-ENABLE_HARD_PROBLEMS_ONLY_SUFFIX = os.getenv("ENABLE_HARD_PROBLEMS_ONLY_SUFFIX", "false").lower() == "true"
-
-
-def is_hard_problem(problem_id: Optional[str]) -> bool:
-    """Return True if the given problem_id is configured as hard.
-
-    When ENABLE_HARD_PROBLEMS_ONLY_SUFFIX is disabled, return True so suffix
-    decoding remains enabled for all problems.
-    """
-    if not ENABLE_HARD_PROBLEMS_ONLY_SUFFIX:
-        return True
-    if problem_id is None:
-        return False
-    return str(problem_id) in HARD_PROBLEMS
-
 
 @contextlib.contextmanager
 def set_shift_parallel_mode(mode: Optional[bool]):
@@ -185,6 +159,80 @@ class ProblemIdContextManager:
         """Clear only the req_id mapping, keep problem_ids."""
         if hasattr(_problem_id_context, 'data'):
             _problem_id_context.data.pop('req_id_to_problem_id', None)
+    
+    @staticmethod
+    def set_hard_medium_ids(hard_ids: list[Optional[str]],
+                            medium_ids: list[Optional[str]]):
+        """Store hard and medium problem_id lists for the current batch."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        _problem_id_context.data['hard_ids'] = hard_ids
+        _problem_id_context.data['medium_ids'] = medium_ids
+    
+    @staticmethod
+    def get_hard_ids() -> list[Optional[str]]:
+        """Get stored hard problem_ids, or empty list if none."""
+        if not hasattr(_problem_id_context, 'data'):
+            return []
+        return _problem_id_context.data.get('hard_ids', [])
+    
+    @staticmethod
+    def get_medium_ids() -> list[Optional[str]]:
+        """Get stored medium problem_ids, or empty list if none."""
+        if not hasattr(_problem_id_context, 'data'):
+            return []
+        return _problem_id_context.data.get('medium_ids', [])
+    
+    @staticmethod
+    def get_hard_medium_ids() -> tuple[list[Optional[str]], list[Optional[str]]]:
+        """Get (hard_ids, medium_ids) tuple for the current batch."""
+        if not hasattr(_problem_id_context, 'data'):
+            return [], []
+        return (
+            _problem_id_context.data.get('hard_ids', []),
+            _problem_id_context.data.get('medium_ids', []),
+        )
+    
+    @staticmethod
+    def clear_hard_medium_ids():
+        """Clear stored hard/medium problem_id lists, keep other context."""
+        if hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data.pop('hard_ids', None)
+            _problem_id_context.data.pop('medium_ids', None)
+    
+    @staticmethod
+    def set_hard_medium_indices(hard_indices: list[int], medium_indices: list[int]):
+        """Store precomputed hard/medium request indices for the current batch."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        _problem_id_context.data['hard_indices'] = list(hard_indices or [])
+        _problem_id_context.data['medium_indices'] = list(medium_indices or [])
+        _problem_id_context.data['has_hm_indices'] = True
+    
+    @staticmethod
+    def get_hard_medium_indices() -> tuple[list[int], list[int]]:
+        """Get stored (hard_indices, medium_indices) or empty lists if none."""
+        if not hasattr(_problem_id_context, 'data'):
+            return [], []
+        return (
+            _problem_id_context.data.get('hard_indices', []) or [],
+            _problem_id_context.data.get('medium_indices', []) or [],
+        )
+    
+    @staticmethod
+    def has_hard_medium_indices() -> bool:
+        """Whether hard/medium indices have been set for the current batch."""
+        if not hasattr(_problem_id_context, 'data'):
+            return False
+        return bool(_problem_id_context.data.get('has_hm_indices', False))
+    
+    @staticmethod
+    def clear_hard_medium_indices():
+        """Clear stored hard/medium indices only."""
+        if hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data.pop('hard_indices', None)
+            _problem_id_context.data.pop('medium_indices', None)
+            _problem_id_context.data.pop('has_hm_indices', None)
     
     @staticmethod
     @contextlib.contextmanager
@@ -315,9 +363,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         #             "Suffix decoding is only supported with the 'arctic', "
         #             "'mlp_speculator' or 'suffix' spec decoding methods.")
         #     self._suffix_cache = SuffixCache(self.speculative_config.suffix_cache_max_depth)
-            # print(f"DEBUG: Initialized suffix cache with max_depth={self.speculative_config.suffix_cache_max_depth}")
-            # print(f"DEBUG: ENABLE_HARD_PROBLEMS_ONLY_SUFFIX={ENABLE_HARD_PROBLEMS_ONLY_SUFFIX}")
-            # print(f"DEBUG: HARD_PROBLEMS={HARD_PROBLEMS}")
             # Optionally bootstrap the suffix cache with provided sequences so
             # that multiple LLM instances can share the same logical suffix tree
             # contents without passing non-picklable objects across processes.
@@ -333,8 +378,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         self._timing_last_flush_time: float = _time.monotonic()
 
         # Precompute output path for this process
-        output_dir = _os.getenv("ARCTIC_METRICS_DIR", "/tmp/arctic_metrics")
+        root_dir = _os.getenv("ARCTIC_METRICS_DIR", "/tmp/arctic_metrics")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = _os.path.join(root_dir, timestamp)
         _os.makedirs(output_dir, exist_ok=True)
+        # Propagate to env so other writers use the same timestamped directory
+        _os.environ["ARCTIC_METRICS_DIR"] = output_dir
         local_rank = _os.getenv("LOCAL_RANK", "0")
         rank = _os.getenv("RANK", "0")
         self._timing_file_path = _os.path.join(
@@ -343,6 +392,16 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         # Ensure buffer flushes on process exit
         _atexit.register(lambda: self._flush_timing_buffer(force=True))
+        
+        # ---- Suffix-tree stats buffered writer (to reduce I/O) ----
+        self._suffix_buffer: list[str] = []
+        self._suffix_flush_every_n: int = int(_os.getenv("ARCTIC_SUFFIX_BUFFER_SIZE", "400"))
+        self._suffix_flush_every_s: float = float(_os.getenv("ARCTIC_SUFFIX_FLUSH_SEC", "5"))
+        self._suffix_last_flush_time: float = _time.monotonic()
+        self._suffix_file_path = _os.path.join(
+            output_dir, f"suffix_tree_stats_rank_{rank}_local_{local_rank}.jsonl"
+        )
+        _atexit.register(lambda: self._flush_suffix_buffer(force=True))
         
         # Initialize tokenizer for text conversion
         self._tokenizer = None
@@ -567,10 +626,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         ):
             self.maybe_setup_kv_connector(scheduler_output)
 
-            # ### Record GPU execution start time for monitoring
-            # torch.cuda.synchronize()
-            # execution_start_time = time.perf_counter()
-            # execution_start_timestamp = datetime.now().isoformat()
+            # # ### Record GPU execution start time for monitoring
+            torch.cuda.synchronize()
+            execution_start_time = time.perf_counter()
+            execution_start_timestamp = datetime.now().isoformat()
             
             model = self.shift_model if use_shift_model else self.model
             with set_shift_parallel_mode(use_shift_model):
@@ -671,11 +730,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             sampler_output.sampled_token_ids = output_token_ids
 
         # #### Record GPU execution end time after all GPU computations are complete
-        # torch.cuda.synchronize()
-        # execution_end_time = time.perf_counter()
-        # execution_duration = execution_end_time - execution_start_time
-        # self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
-        #                         scheduler_output.total_num_scheduled_tokens, early_return=False)
+        torch.cuda.synchronize()
+        execution_end_time = time.perf_counter()
+        execution_duration = execution_end_time - execution_start_time
+        self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
+                                scheduler_output.total_num_scheduled_tokens, early_return=False)
 
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -733,7 +792,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             valid_sampled_token_ids[i].clear()
 
         ### profiling suffix_tree_stats: now may have bug 
-        #self._log_suffix_tree_stats(num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
+        self._log_suffix_tree_stats(num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
 
         #print(f"DEBUG: sampled_token_ids: {sampled_token_ids}")
             
@@ -769,7 +828,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             self._update_suffix_cache(valid_sampled_token_ids)
 
 
-        ### profiling suffix tree decoding
+        # ### profiling suffix tree decoding
         # torch.cuda.synchronize()
         # execution_start_time = time.perf_counter()
         # execution_start_timestamp = datetime.now().isoformat()
@@ -792,15 +851,19 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 attn_metadata,
             )
             
+            # Determine whether to enable confidence-based filtering of spec tokens.
+            
+            confidence_based_only = bool(getattr(self.speculative_config, "confidence_based_only", False))
+            distribution_aware = bool(getattr(self.speculative_config, "distribution_aware", False))
             # # # # # # 统计和控制 spec_token 数量
-            if spec_token_ids is not None:
+            if spec_token_ids is not None and confidence_based_only:
                 # 统计总的 spec_token 数量
                 total_spec_tokens = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
                 
                 # 如果数量超过128，按比例删除一部分
-                if total_spec_tokens > 200:
+                if total_spec_tokens > 300:
                     # 计算需要保留的比例
-                    keep_ratio = 200 / total_spec_tokens
+                    keep_ratio = 300 / total_spec_tokens
                     
                     # 对每个子列表按比例保留 tokens
                     filtered_spec_token_ids = []
@@ -816,100 +879,25 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     
                     spec_token_ids = filtered_spec_token_ids
                     
-                   # 记录统计信息（可选）
-                    # filtered_total = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
-                    # print(f"Spec tokens reduced: {total_spec_tokens} -> {filtered_total} (ratio: {keep_ratio:.3f})")
-            total_proposed = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
+            # total_proposed = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
+            # torch.cuda.synchronize()
             # execution_end_time = time.perf_counter()
             # execution_duration = execution_end_time - execution_start_time
             # self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
-            #                     total_proposed, early_return=False)
-            # self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
-            #                     scheduler_output.total_num_scheduled_tokens, early_return=False)
+            #                         scheduler_output.total_num_scheduled_tokens, early_return=False)
 
 
-                    # # # 统计和控制 spec_token 数量
-            # if spec_token_ids is not None:
-            #     # 分类请求：HARD_PROBLEMS vs 非HARD_PROBLEMS
-            #     hard_indices = []
-            #     non_hard_indices = []
-                
-            #     for i, req_id in enumerate(self.input_batch.req_ids):
-            #         problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
-            #         if str(problem_id) in HARD_PROBLEMS:
-            #             hard_indices.append(i)
-            #         else:
-            #             non_hard_indices.append(i)
-                
-            #     # 统计HARD_PROBLEMS的spec_tokens数量
-            #     hard_spec_tokens = 0
-            #     for i in hard_indices:
-            #         if i < len(spec_token_ids) and spec_token_ids[i] is not None:
-            #             hard_spec_tokens += len(spec_token_ids[i])
-                
-            #     # 根据HARD_PROBLEMS的tokens数量决定策略
-            #     if hard_spec_tokens > 200:
-            #         # 策略1: HARD_PROBLEMS超过200，按比例削减HARD_PROBLEMS，删除所有非HARD_PROBLEMS
-            #         keep_ratio = 200 / hard_spec_tokens
-                    
-            #         filtered_spec_token_ids = []
-            #         for i in range(len(spec_token_ids)):
-            #             if i in hard_indices:
-            #                 # HARD_PROBLEMS请求：按比例削减
-            #                 if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
-            #                     keep_count = max(1, int(len(spec_token_ids[i]) * keep_ratio))
-            #                     filtered_tokens = spec_token_ids[i][:keep_count]
-            #                     filtered_spec_token_ids.append(filtered_tokens)
-            #                 else:
-            #                     filtered_spec_token_ids.append(spec_token_ids[i])
-            #             else:
-            #                 # 非HARD_PROBLEMS请求：删除所有spec_tokens
-            #                 filtered_spec_token_ids.append([])
-                    
-            #         spec_token_ids = filtered_spec_token_ids
-                    
-            #     else:
-            #         # 策略2: HARD_PROBLEMS未超过200，保持HARD_PROBLEMS不变，给非HARD_PROBLEMS分配剩余配额
-            #         remaining_quota = 200 - hard_spec_tokens
-                    
-            #         # 统计非HARD_PROBLEMS的原始tokens数量
-            #         non_hard_spec_tokens = 0
-            #         for i in non_hard_indices:
-            #             if i < len(spec_token_ids) and spec_token_ids[i] is not None:
-            #                 non_hard_spec_tokens += len(spec_token_ids[i])
-                    
-            #         if non_hard_spec_tokens > 0 and remaining_quota > 0:
-            #             # 计算非HARD_PROBLEMS的缩放比例
-            #             non_hard_ratio = min(1.0, remaining_quota / non_hard_spec_tokens)
-                        
-            #             filtered_spec_token_ids = []
-            #             for i in range(len(spec_token_ids)):
-            #                 if i in hard_indices:
-            #                     # HARD_PROBLEMS请求：保持不变
-            #                     filtered_spec_token_ids.append(spec_token_ids[i])
-            #                 else:
-            #                     # 非HARD_PROBLEMS请求：按比例缩放
-            #                     if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
-            #                         keep_count = max(0, int(len(spec_token_ids[i]) * non_hard_ratio))
-            #                         if keep_count > 0:
-            #                             filtered_tokens = spec_token_ids[i][:keep_count]
-            #                             filtered_spec_token_ids.append(filtered_tokens)
-            #                         else:
-            #                             filtered_spec_token_ids.append([])
-            #                     else:
-            #                         filtered_spec_token_ids.append(spec_token_ids[i])
-                        
-            #             spec_token_ids = filtered_spec_token_ids
-            #         elif remaining_quota <= 0:
-            #             # 剩余配额不足，删除所有非HARD_PROBLEMS的spec_tokens
-            #             filtered_spec_token_ids = []
-            #             for i in range(len(spec_token_ids)):
-            #                 if i in hard_indices:
-            #                     filtered_spec_token_ids.append(spec_token_ids[i])
-            #                 else:
-            #                     filtered_spec_token_ids.append([])
-                        
-            #             spec_token_ids = filtered_spec_token_ids
+            # # # 统计和控制 spec_token 数量（优先 hard，再分配 medium）
+            if spec_token_ids is not None and distribution_aware:
+                hard_indices, medium_indices = self._get_hard_and_non_hard_indices()
+
+                # 先按 hard 分配，再将剩余分配给 medium，配额总量为 200
+                spec_token_ids = self._apply_quota_to_spec_tokens(
+                    spec_token_ids=spec_token_ids,
+                    hard_indices=hard_indices,
+                    non_hard_indices=medium_indices,
+                    quota=300,
+                )
 
         # Clear KVConnector state after all KVs are generated.
         if has_kv_transfer_group():
@@ -994,6 +982,111 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             if m:
                 return m.group(1)
         return None
+
+    def _get_hard_and_non_hard_indices(self, top_percent: float = 0.3) -> tuple[list[int], list[int]]:
+        """
+        计算当前 batch 中的 hard 和 medium 请求索引。
+
+        基于 ProblemIdContextManager.get_hard_medium_ids() 提供的 problem_id 列表，
+        将属于 hard_ids 的请求划为 hard，将属于 medium_ids 的请求划为 non-hard（此处表示 medium）。
+        其他未列入者不分配配额。
+        """
+        # 优先使用已缓存的索引，以避免在 generate_sequences 的多次 execute_model 调用中重复计算
+        try:
+            if ProblemIdContextManager.has_hard_medium_indices():
+                cached_hard, cached_medium = ProblemIdContextManager.get_hard_medium_indices()
+                return cached_hard, cached_medium
+        except Exception:
+            pass
+
+        hard_indices: list[int] = []
+        medium_indices: list[int] = []
+
+        try:
+            hard_ids, medium_ids = ProblemIdContextManager.get_hard_medium_ids()
+        except Exception:
+            hard_ids, medium_ids = [], []
+        hard_set = set(str(pid) for pid in (hard_ids or []))
+        medium_set = set(str(pid) for pid in (medium_ids or []))
+
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            problem_id = None
+            try:
+                problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
+            except Exception:
+                pass
+            pid_str = str(problem_id)
+            if pid_str in hard_set:
+                hard_indices.append(i)
+            elif pid_str in medium_set:
+                medium_indices.append(i)
+
+        # 缓存索引，供后续 execute_model 直接复用
+        try:
+            ProblemIdContextManager.set_hard_medium_indices(hard_indices, medium_indices)
+        except Exception:
+            pass
+
+        return hard_indices, medium_indices
+
+    def _apply_quota_to_spec_tokens(
+        self,
+        spec_token_ids: list,
+        hard_indices: list[int],
+        non_hard_indices: list[int],
+        quota: int = 200,
+    ) -> list:
+        """
+        在给定配额下调整 `spec_token_ids`：
+        - 仅保留 hard 与 medium（通过 non_hard_indices 传入）两类请求；
+        - 若 hard 请求总 tokens 超额，则按比例削减 hard，其他全部清空；
+        - 否则，先完整保留 hard，再将剩余配额按比例分配给 medium；
+        - 不在 hard/medium 中的请求其 tokens 一律清空。
+        """
+        allowed_indices = set(hard_indices) | set(non_hard_indices)
+
+        # 统计 hard 请求的 tokens 数量
+        hard_spec_tokens = 0
+        for i in hard_indices:
+            if i < len(spec_token_ids) and spec_token_ids[i] is not None:
+                hard_spec_tokens += len(spec_token_ids[i])
+
+        if hard_spec_tokens > quota:
+            keep_ratio = quota / max(1, hard_spec_tokens)
+            filtered_spec_token_ids = [[] for _ in range(len(spec_token_ids))]
+            for i in hard_indices:
+                if i < len(spec_token_ids) and spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
+                    keep_count = max(1, int(len(spec_token_ids[i]) * keep_ratio))
+                    filtered_spec_token_ids[i] = spec_token_ids[i][:keep_count]
+            return filtered_spec_token_ids
+
+        remaining_quota = quota - hard_spec_tokens
+
+        # 初始化结果：默认全部清空，仅对 allowed_indices 赋值
+        filtered_spec_token_ids = [[] for _ in range(len(spec_token_ids))]
+
+        # 先完整保留 hard 请求（不超额时）
+        for i in hard_indices:
+            if i < len(spec_token_ids):
+                filtered_spec_token_ids[i] = spec_token_ids[i]
+
+        # 统计 medium（通过 non_hard_indices 传入）请求的 tokens 数量
+        non_hard_spec_tokens = 0
+        for i in non_hard_indices:
+            if i < len(spec_token_ids) and spec_token_ids[i] is not None:
+                non_hard_spec_tokens += len(spec_token_ids[i])
+
+        if non_hard_spec_tokens > 0 and remaining_quota > 0:
+            non_hard_ratio = min(1.0, remaining_quota / max(1, non_hard_spec_tokens))
+            for i in non_hard_indices:
+                if i < len(spec_token_ids) and spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
+                    keep_count = max(0, int(len(spec_token_ids[i]) * non_hard_ratio))
+                    if keep_count > 0:
+                        filtered_spec_token_ids[i] = spec_token_ids[i][:keep_count]
+            return filtered_spec_token_ids
+
+        # 无剩余配额或 medium 无 tokens 时，仅保留 hard，其余为空
+        return filtered_spec_token_ids
 
     def get_current_batch_problem_ids(self) -> list[Optional[str]]:
         """
@@ -1167,28 +1260,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 num_prompt_tokens = self.input_batch.num_prompt_tokens[index]
                 prompt_token_ids = (
                     self.input_batch.token_ids_cpu[index, :num_prompt_tokens])
-                print(f"DEBUG: Caching prompt for req_id={req_id}, prompt_tokens={num_prompt_tokens}")
+                #print(f"DEBUG: Caching prompt for req_id={req_id}, prompt_tokens={num_prompt_tokens}")
                 self._suffix_cache.cache_prompt(req_id, prompt_token_ids)
 
             #print(f"DEBUG: Updating response for req_id={req_id} with {len(sampled_ids)} tokens")
             self._suffix_cache.update_response(req_id, problem_id,sampled_ids)
-
-        # # Evict prompts that are not seen to prevent memory leaks
-        # for req_id in self._suffix_cache.cached_prompt_ids():
-        #     if req_id not in seen_req_ids:
-        #         try:
-        #             self._suffix_cache.evict_prompt(req_id)
-        #         except ValueError:
-        #             # Already evicted
-        #             pass
-        # for problem_id in self._current_batch_problem_ids:
-        #     if problem_id not in seen_problem_ids:
-        #         try:
-        #             self._suffix_cache.evict_problem(problem_id)
-        #         except ValueError:
-        #             # Already evicted
-        #             pass
-
 
     def _process_single_speculation(self, args):
         """Process a single speculation request for parallel execution"""
@@ -1223,7 +1299,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         pattern = pattern.tolist() + spec_ids
         if len(pattern) > config.suffix_cache_max_depth:
             pattern = pattern[-config.suffix_cache_max_depth:]
-        max_spec_tokens = min(MAX_SPEC_LEN - len(spec_ids),
+        max_spec_tokens = min(config.num_speculative_tokens if config.num_speculative_tokens is not None else  config.suffix_cache_max_depth,
+                              MAX_SPEC_LEN - len(spec_ids),
                               config.suffix_cache_max_depth,
                               self.max_model_len - end_idx - 1)
         # max_spec_offset is modified to mimic the behavior of the original
@@ -1251,59 +1328,59 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             min_token_prob=config.suffix_min_token_prob)
 
         # # Debug output - capture match and spec token information
-        # if hasattr(self, '_debug_spec_file') and self._debug_spec_file:
-        #     self._step_counter += 1
-        #     
-        #     # Extract match tokens from pattern based on match length
-        #     match_tokens = pattern[-result.match_len:] if result.match_len > 0 else []
-        #     match_text = ""
-        #     if self._tokenizer and match_tokens:
-        #         try:
-        #             match_text = self._tokenizer.decode(match_tokens, skip_special_tokens=True)
-        #         except:
-        #             match_text = ""
-        #     
-        #     # Spec tokens from result
-        #     spec_tokens = result.token_ids if hasattr(result, 'token_ids') else []
-        #     spec_text = ""
-        #     if self._tokenizer and spec_tokens:
-        #         try:
-        #             spec_text = self._tokenizer.decode(spec_tokens, skip_special_tokens=True)
-        #         except:
-        #             spec_text = ""
-        #     
-        #     # Pattern tokens (the search pattern used)
-        #     pattern_text = ""
-        #     if self._tokenizer and pattern:
-        #         try:
-        #             pattern_text = self._tokenizer.decode(pattern, skip_special_tokens=True)
-        #         except:
-        #             pattern_text = ""
-        #     
-        #     # Create debug data similar to simulator
-        #     debug_data = {
-        #         "request_id": req_id,
-        #         "step": self._step_counter,
-        #         "batch_index": i,
-        #         "pattern": pattern,
-        #         "pattern_text": pattern_text,
-        #         "pattern_length": len(pattern),
-        #         "match_tokens": match_tokens,
-        #         "match_text": match_text,
-        #         "match_length": result.match_len,
-        #         "spec_tokens": spec_tokens,
-        #         "spec_text": spec_text,
-        #         "num_spec_tokens": len(spec_tokens),
-        #         "sampled_tokens": sampled_ids,
-        #         "existing_spec_tokens": spec_ids,
-        #         "score": getattr(result, 'score', 0.0),
-        #         "max_spec_tokens": max_spec_tokens,
-        #         "max_spec_factor": max_spec_factor,
-        #         "max_spec_offset": max_spec_offset
-        #     }
-        #     
-        #     self._debug_spec_file.write(json.dumps(debug_data, ensure_ascii=False) + '\n')
-        #     self._debug_spec_file.flush()
+        if hasattr(self, '_debug_spec_file') and self._debug_spec_file:
+            self._step_counter += 1
+            
+            # Extract match tokens from pattern based on match length
+            match_tokens = pattern[-result.match_len:] if result.match_len > 0 else []
+            match_text = ""
+            if self._tokenizer and match_tokens:
+                try:
+                    match_text = self._tokenizer.decode(match_tokens, skip_special_tokens=True)
+                except:
+                    match_text = ""
+            
+            # Spec tokens from result
+            spec_tokens = result.token_ids if hasattr(result, 'token_ids') else []
+            spec_text = ""
+            if self._tokenizer and spec_tokens:
+                try:
+                    spec_text = self._tokenizer.decode(spec_tokens, skip_special_tokens=True)
+                except:
+                    spec_text = ""
+            
+            # Pattern tokens (the search pattern used)
+            pattern_text = ""
+            if self._tokenizer and pattern:
+                try:
+                    pattern_text = self._tokenizer.decode(pattern, skip_special_tokens=True)
+                except:
+                    pattern_text = ""
+            
+            # Create debug data similar to simulator
+            debug_data = {
+                "request_id": req_id,
+                "step": self._step_counter,
+                "batch_index": i,
+                "pattern": pattern,
+                "pattern_text": pattern_text,
+                "pattern_length": len(pattern),
+                "match_tokens": match_tokens,
+                "match_text": match_text,
+                "match_length": result.match_len,
+                "spec_tokens": spec_tokens,
+                "spec_text": spec_text,
+                "num_spec_tokens": len(spec_tokens),
+                "sampled_tokens": sampled_ids,
+                "existing_spec_tokens": spec_ids,
+                "score": getattr(result, 'score', 0.0),
+                "max_spec_tokens": max_spec_tokens,
+                "max_spec_factor": max_spec_factor,
+                "max_spec_offset": max_spec_offset
+            }
+            
+            self._debug_spec_file.write(json.dumps(debug_data, ensure_ascii=False) + '\n')
+            self._debug_spec_file.flush()
 
         return result
 
@@ -1324,30 +1401,40 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         #     self._debug_spec_file = open(debug_file_path, 'w', encoding='utf-8')
         #     self._step_counter = 0
         
-        # Prepare arguments for parallel processing
-        batch_args = []
-        for i, sampled_ids in enumerate(sampled_token_ids):
-            spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
-            batch_args.append((i, sampled_ids, spec_ids, config))
-        
+        # Determine which indices are allowed (hard and medium only)
+        try:
+            hard_indices, medium_indices = self._get_hard_and_non_hard_indices()
+        except Exception:
+            hard_indices, medium_indices = [], []
+        allowed_indices = set(hard_indices) | set(medium_indices)
+
+        # Pre-initialize results for all requests; default is empty for non-allowed
+        results: list[SuffixSpecResult] = [SuffixSpecResult() for _ in range(len(sampled_token_ids))]
+
+        # Build tasks only for allowed indices
+        tasks = []
+        for i in sorted(allowed_indices):
+            if 0 <= i < len(sampled_token_ids):
+                sampled_ids = sampled_token_ids[i]
+                spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+                tasks.append((i, sampled_ids, spec_ids, config))
+
+        if not tasks:
+            return results
+
         # Use ThreadPoolExecutor for parallel processing
-        # The number of workers is automatically determined by the SuffixCache's thread configuration
-        max_workers = min(len(batch_args), getattr(self._suffix_cache, '_max_threads', 4))
+        max_workers = min(len(tasks), getattr(self._suffix_cache, '_max_threads', 4))
         
         with ThreadPoolExecutor(max_workers=1) as executor:
-            # Submit all tasks and maintain order using list comprehension
             future_to_index = {executor.submit(self._process_single_speculation, args): i 
-                             for i, args in enumerate(batch_args)}
-            
-            # Collect results in order
-            results = [None] * len(batch_args)
+                               for (i, *_), args in zip([t for t in tasks], tasks)}
             for future in future_to_index:
                 index = future_to_index[future]
                 try:
                     results[index] = future.result()
                 except Exception as e:
                     print(f"Error processing speculation for index {index}: {e}")
-                    results[index] = SuffixSpecResult()  # Fallback to empty result
+                    results[index] = SuffixSpecResult()
 
         return results
 
@@ -1554,6 +1641,27 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         else:
             return str(obj)  # Fallback to string representation
 
+    def _flush_suffix_buffer(self, force: bool = False):
+        """Flush buffered suffix-tree stats lines to disk.
+
+        When force is True, flush unconditionally (e.g., at exit).
+        """
+        try:
+            if not self._suffix_buffer and not force:
+                return
+            # Nothing to write if empty and not forced
+            if not self._suffix_buffer:
+                self._suffix_last_flush_time = time.monotonic()
+                return
+
+            # Write all pending lines at once
+            with open(self._suffix_file_path, "a") as f:
+                f.write("\n".join(self._suffix_buffer) + "\n")
+            self._suffix_buffer.clear()
+            self._suffix_last_flush_time = time.monotonic()
+        except Exception as e:
+            logger.error(f"Failed to flush suffix-tree stats: {e}")
+
     def _log_suffix_tree_stats(self, num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids):
         """Log suffix tree decoding statistics for this execute_model call"""
         if not hasattr(self, 'input_batch') or not self.input_batch:
@@ -1631,23 +1739,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         else:
             self._debug_call_count = 1
             
-        # # Log debug info for first few calls
-        # if self._debug_call_count <= 5:
-        #     if len(valid_sampled_token_ids) > 0:
-        #         sample_tokens = valid_sampled_token_ids[0] if len(valid_sampled_token_ids) > 0 else []
-        #         total_tokens = len(sample_tokens)
-        #         spec_tokens = max(0, total_tokens - 1)  # Calculate spec tokens (total - 1)
-        #         # print(f"DEBUG Call {self._debug_call_count}: valid_sampled_token_ids[0] = {sample_tokens[:20] if len(sample_tokens) > 20 else sample_tokens}")
-        #         # print(f"DEBUG Call {self._debug_call_count}: valid_tokens[0] length = {total_tokens}, spec_tokens = {spec_tokens}")
-            
-            
-        #     draft_sample = draft_token_ids
-        #     #print(f"DEBUG Call {self._debug_call_count}: draft_token_ids (first 20) = {draft_sample.shape}")
-            
-        #     if num_draft_tokens:
-        #         print(f"DEBUG Call {self._debug_call_count}: num_draft_tokens = {num_draft_tokens}")
-        #     print(f"DEBUG Call {self._debug_call_count}: total_proposed = {total_proposed}, total_accepted = {total_accepted}")
-
         # Only log if there were spec tokens proposed
         if True:
             stats_data = {
@@ -1671,31 +1762,22 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             #print("DEBUG:cu_num_draft_tokens: ", len(cu_num_draft_tokens),cu_num_draft_tokens[:5])
             
             # Write token data to separate file
-            self._write_token_data_to_file(draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
+            #self._write_token_data_to_file(draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
     
     def _write_suffix_tree_stats(self, stats_data):
-        """Write suffix tree decoding statistics to file with conflict avoidance"""
+        """Buffer suffix-tree stats and flush periodically to reduce I/O."""
         try:
-            # Use environment variable for output directory
-            output_dir = os.getenv("ARCTIC_METRICS_DIR", "/app/src")
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Get process info for filename
-            local_rank = os.getenv("LOCAL_RANK", "0")
-            rank = os.getenv("RANK", "0")
-            
-            # Create separate files for each process to avoid conflicts
-            stats_file = os.path.join(output_dir, f"suffix_tree_stats_rank_{rank}_local_{local_rank}.jsonl")
-            
-            # Write with immediate flush to ensure data is written atomically
-            with open(stats_file, "a") as f:
-                f.write(json.dumps(stats_data, default=self._json_serializable) + "\n")
-                f.flush()  # Force immediate write to disk
-                os.fsync(f.fileno())  # Force OS to write to storage
-                
+            # Enqueue stats data
+            self._suffix_buffer.append(json.dumps(stats_data, default=self._json_serializable))
+
+            # Flush conditions: buffer size or time threshold
+            should_flush_by_n = len(self._suffix_buffer) >= self._suffix_flush_every_n
+            should_flush_by_time = (time.monotonic() - self._suffix_last_flush_time) >= self._suffix_flush_every_s
+            if should_flush_by_n or should_flush_by_time:
+                self._flush_suffix_buffer()
         except Exception as e:
             # Log error but don't crash the model
-            logger.error(f"Failed to write suffix tree stats: {e}")
+            logger.error(f"Failed to buffer suffix tree stats: {e}")
     
     def _write_token_data(self, token_data):
         """Write draft and valid token data to a separate file"""

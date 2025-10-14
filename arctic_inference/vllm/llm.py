@@ -230,7 +230,7 @@ def apply_llm_patches():
                     current_mapping[req_id] = problem_id
                     ProblemIdContextManager.set_req_id_to_problem_id_mapping(current_mapping)
                     logger.debug(f"Mapped req_id {req_id} -> problem_id {problem_id}")
-                    print(f"Mapped req_id {req_id} -> problem_id {problem_id}")
+                    #print(f"Mapped req_id {req_id} -> problem_id {problem_id}")
                 except Exception as e:
                     logger.warning(f"Failed to record req_id mapping for {req_id}: {e}")
                     print(f"Failed to record req_id mapping for {req_id}: {e}")
