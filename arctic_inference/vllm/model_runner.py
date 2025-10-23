@@ -110,8 +110,7 @@ class ProblemIdContextManager:
     @staticmethod
     def get_current_batch_problem_ids() -> list[Optional[str]]:
         """Get problem_ids for the current batch."""
-        if not hasattr(_problem_id_context, 'data'):
-            return []
+        assert _problem_id_context.data.get('problem_ids') is not None, "problem_ids not found in _problem_id_context.data"
         return _problem_id_context.data.get('problem_ids', [])
     
     @staticmethod
@@ -124,8 +123,7 @@ class ProblemIdContextManager:
     @staticmethod
     def get_req_id_to_problem_id_mapping() -> dict[str, Optional[str]]:
         """Get the req_id to problem_id mapping."""
-        if not hasattr(_problem_id_context, 'data'):
-            return {}
+        assert _problem_id_context.data.get('req_id_to_problem_id') is not None, "req_id_to_problem_id not found in _problem_id_context.data"
         return _problem_id_context.data.get('req_id_to_problem_id', {})
     
     # @staticmethod
@@ -142,10 +140,8 @@ class ProblemIdContextManager:
     @staticmethod
     def get_problem_id_for_req_id(req_id: str) -> Optional[str]:
         """Get problem_id for a specific req_id."""
-        if not hasattr(_problem_id_context, 'data'):
-            return None
-        
-        mapping = _problem_id_context.data.get('req_id_to_problem_id', {})
+        assert _problem_id_context.data.get('req_id_to_problem_id') is not None, "req_id_to_problem_id not found in _problem_id_context.data"
+        mapping = _problem_id_context.data.get('req_id_to_problem_id')
         return mapping.get(req_id)
     
     @staticmethod
@@ -153,70 +149,54 @@ class ProblemIdContextManager:
         """Clear the current context."""
         if hasattr(_problem_id_context, 'data'):
             _problem_id_context.data = {}
-    
-    @staticmethod
-    def clear_req_id_mapping():
-        """Clear only the req_id mapping, keep problem_ids."""
-        if hasattr(_problem_id_context, 'data'):
-            _problem_id_context.data.pop('req_id_to_problem_id', None)
+
     
     @staticmethod
     def set_hard_medium_ids(hard_ids: list[Optional[str]],
-                            medium_ids: list[Optional[str]]):
+                            medium_ids: list[Optional[str]],
+                            easy_ids: list[Optional[str]]):
         """Store hard and medium problem_id lists for the current batch."""
         if not hasattr(_problem_id_context, 'data'):
             _problem_id_context.data = {}
         _problem_id_context.data['hard_ids'] = hard_ids
         _problem_id_context.data['medium_ids'] = medium_ids
+        _problem_id_context.data['easy_ids'] = easy_ids
     
     @staticmethod
-    def get_hard_ids() -> list[Optional[str]]:
-        """Get stored hard problem_ids, or empty list if none."""
-        if not hasattr(_problem_id_context, 'data'):
-            return []
-        return _problem_id_context.data.get('hard_ids', [])
-    
-    @staticmethod
-    def get_medium_ids() -> list[Optional[str]]:
-        """Get stored medium problem_ids, or empty list if none."""
-        if not hasattr(_problem_id_context, 'data'):
-            return []
-        return _problem_id_context.data.get('medium_ids', [])
-    
-    @staticmethod
-    def get_hard_medium_ids() -> tuple[list[Optional[str]], list[Optional[str]]]:
+    def get_hard_medium_ids() -> tuple[list[Optional[str]], list[Optional[str]], list[Optional[str]]]:
         """Get (hard_ids, medium_ids) tuple for the current batch."""
-        if not hasattr(_problem_id_context, 'data'):
-            return [], []
+        assert _problem_id_context.data.get('hard_ids') is not None, "hard_ids not found in _problem_id_context.data"
+        assert _problem_id_context.data.get('medium_ids') is not None, "medium_ids not found in _problem_id_context.data"
+        assert _problem_id_context.data.get('easy_ids') is not None, "easy_ids not found in _problem_id_context.data"
         return (
             _problem_id_context.data.get('hard_ids', []),
             _problem_id_context.data.get('medium_ids', []),
+            _problem_id_context.data.get('easy_ids', []),
         )
-    
+
     @staticmethod
-    def clear_hard_medium_ids():
-        """Clear stored hard/medium problem_id lists, keep other context."""
-        if hasattr(_problem_id_context, 'data'):
-            _problem_id_context.data.pop('hard_ids', None)
-            _problem_id_context.data.pop('medium_ids', None)
-    
-    @staticmethod
-    def set_hard_medium_indices(hard_indices: list[int], medium_indices: list[int]):
+    def set_hard_medium_indices(hard_indices: list[int], medium_indices: list[int], easy_indices: list[int], allowed_indices: list[int]):
         """Store precomputed hard/medium request indices for the current batch."""
         if not hasattr(_problem_id_context, 'data'):
             _problem_id_context.data = {}
         _problem_id_context.data['hard_indices'] = list(hard_indices or [])
         _problem_id_context.data['medium_indices'] = list(medium_indices or [])
+        _problem_id_context.data['easy_indices'] = list(easy_indices or [])
+        _problem_id_context.data['allowed_indices'] = list(allowed_indices or [])
         _problem_id_context.data['has_hm_indices'] = True
     
     @staticmethod
-    def get_hard_medium_indices() -> tuple[list[int], list[int]]:
+    def get_hard_medium_indices() -> tuple[list[int], list[int], list[int], list[int]]:
         """Get stored (hard_indices, medium_indices) or empty lists if none."""
-        if not hasattr(_problem_id_context, 'data'):
-            return [], []
+        assert _problem_id_context.data.get('hard_indices') is not None, "hard_indices not found in _problem_id_context.data"
+        assert _problem_id_context.data.get('medium_indices') is not None, "medium_indices not found in _problem_id_context.data"
+        assert _problem_id_context.data.get('easy_indices') is not None, "easy_indices not found in _problem_id_context.data"
+        assert _problem_id_context.data.get('allowed_indices') is not None, "allowed_indices not found in _problem_id_context.data"
         return (
             _problem_id_context.data.get('hard_indices', []) or [],
             _problem_id_context.data.get('medium_indices', []) or [],
+            _problem_id_context.data.get('easy_indices', []) or [],
+            _problem_id_context.data.get('allowed_indices', []) or [],
         )
     
     @staticmethod
@@ -226,13 +206,26 @@ class ProblemIdContextManager:
             return False
         return bool(_problem_id_context.data.get('has_hm_indices', False))
     
+    # @staticmethod
+    # def clear_hard_medium_indices():
+    #     """Clear stored hard/medium indices only."""
+    #     if hasattr(_problem_id_context, 'data'):
+    #         _problem_id_context.data.pop('hard_indices', None)
+    #         _problem_id_context.data.pop('medium_indices', None)
+    #         _problem_id_context.data.pop('has_hm_indices', None)
+    
     @staticmethod
-    def clear_hard_medium_indices():
-        """Clear stored hard/medium indices only."""
-        if hasattr(_problem_id_context, 'data'):
-            _problem_id_context.data.pop('hard_indices', None)
-            _problem_id_context.data.pop('medium_indices', None)
-            _problem_id_context.data.pop('has_hm_indices', None)
+    def set_current_step(current_step: Optional[int]):
+        """Set current training step."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        _problem_id_context.data['current_step'] = current_step
+    
+    @staticmethod
+    def get_current_step() -> Optional[int]:
+        """Get current training step."""
+        return _problem_id_context.data.get('current_step')
+    
     
     @staticmethod
     @contextlib.contextmanager
@@ -295,8 +288,6 @@ def extract_problem_id_from_prompt(prompt) -> Optional[str]:
 
 
 
-
-
 class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
     _orig_initialize_kv_cache = GPUModelRunner.initialize_kv_cache
@@ -340,6 +331,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         # Set up speculative decoding.
         self._suffix_cache = None
+        # 🚀 Initialize persistent thread pool for suffix speculation
+        self._speculation_threadpool = None
+        self._speculation_max_workers = 8
+        
         if arctic_speculative_config is not None:
             # Restore the speculative config.
             self.vllm_config.speculative_config = arctic_speculative_config
@@ -372,10 +367,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         import atexit as _atexit
 
         # Buffer config via env with sensible defaults
-        self._timing_buffer: list[dict] = []
+        self._gpu_timing_buffer: list[str] = []
+        self._cpu_timing_buffer: list[str] = []
         self._timing_flush_every_n: int = int(_os.getenv("ARCTIC_TIMING_BUFFER_SIZE", "400"))
         self._timing_flush_every_s: float = float(_os.getenv("ARCTIC_TIMING_FLUSH_SEC", "5"))
-        self._timing_last_flush_time: float = _time.monotonic()
+        self._timing_last_flush_time: dict[str, float] = {
+            "GPU_execution_time": _time.monotonic(),
+            "CPU_execution_time": _time.monotonic()
+        }
 
         # Precompute output path for this process
         root_dir = _os.getenv("ARCTIC_METRICS_DIR", "/tmp/arctic_metrics")
@@ -386,12 +385,23 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         _os.environ["ARCTIC_METRICS_DIR"] = output_dir
         local_rank = _os.getenv("LOCAL_RANK", "0")
         rank = _os.getenv("RANK", "0")
-        self._timing_file_path = _os.path.join(
-            output_dir, f"execution_timing_rank_{rank}_local_{local_rank}.jsonl"
+        
+        # Store base paths for dynamic file generation with current_step
+        self._output_dir = output_dir
+        self._rank = rank
+        self._local_rank = local_rank
+        
+        # Keep old paths for backward compatibility (when current_step is not available)
+        self._timing_file_path_gpu = _os.path.join(
+            output_dir, f"GPU_execution_timing_rank_{rank}_local_{local_rank}.jsonl"
+        )
+        self._timing_file_path_cpu = _os.path.join(
+            output_dir, f"CPU_execution_timing_rank_{rank}_local_{local_rank}.jsonl"
         )
 
-        # Ensure buffer flushes on process exit
-        _atexit.register(lambda: self._flush_timing_buffer(force=True))
+        # Ensure buffer flushes on process exit for both GPU and CPU timing
+        _atexit.register(lambda: self._flush_timing_buffer(force=True, doc_type="GPU_execution_time"))
+        _atexit.register(lambda: self._flush_timing_buffer(force=True, doc_type="CPU_execution_time"))
         
         # ---- Suffix-tree stats buffered writer (to reduce I/O) ----
         self._suffix_buffer: list[str] = []
@@ -402,6 +412,16 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             output_dir, f"suffix_tree_stats_rank_{rank}_local_{local_rank}.jsonl"
         )
         _atexit.register(lambda: self._flush_suffix_buffer(force=True))
+        
+        # ---- Suffix speculation timing stats buffered writer ----
+        self._suffix_timing_buffer: list[str] = []
+        self._suffix_timing_flush_every_n: int = int(_os.getenv("ARCTIC_SUFFIX_TIMING_BUFFER_SIZE", "400"))
+        self._suffix_timing_flush_every_s: float = float(_os.getenv("ARCTIC_SUFFIX_TIMING_FLUSH_SEC", "5"))
+        self._suffix_timing_last_flush_time: float = _time.monotonic()
+        self._suffix_timing_file_path = _os.path.join(
+            output_dir, f"suffix_speculation_timing_rank_{rank}_local_{local_rank}.jsonl"
+        )
+        _atexit.register(lambda: self._flush_suffix_timing_buffer(force=True))
         
         # Initialize tokenizer for text conversion
         self._tokenizer = None
@@ -734,7 +754,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         execution_end_time = time.perf_counter()
         execution_duration = execution_end_time - execution_start_time
         self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
-                                scheduler_output.total_num_scheduled_tokens, early_return=False)
+                                scheduler_output.total_num_scheduled_tokens, early_return=False, doc_type="GPU_execution_time")
 
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -824,16 +844,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             req_state.output_token_ids.extend(sampled_ids)
 
 
-        if self._suffix_cache is not None:
-            self._update_suffix_cache(valid_sampled_token_ids)
-
-
-        # ### profiling suffix tree decoding
-        # torch.cuda.synchronize()
-        # execution_start_time = time.perf_counter()
-        # execution_start_timestamp = datetime.now().isoformat()
+        # ### profiling suffix tree decoding (CPU execution time)
+        torch.cuda.synchronize()
+        cpu_execution_start_time = time.perf_counter()
+        cpu_execution_start_timestamp = datetime.now().isoformat()
         
 
+        if self._suffix_cache is not None:
+            self._update_suffix_cache(valid_sampled_token_ids)
         if not self.speculative_config:
             # Speculative decoding is not enabled.
             spec_token_ids = None
@@ -850,9 +868,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 spec_decode_metadata,
                 attn_metadata,
             )
-            
+                       
             # Determine whether to enable confidence-based filtering of spec tokens.
-            
             confidence_based_only = bool(getattr(self.speculative_config, "confidence_based_only", False))
             distribution_aware = bool(getattr(self.speculative_config, "distribution_aware", False))
             # # # # # # 统计和控制 spec_token 数量
@@ -878,26 +895,24 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                             filtered_spec_token_ids.append(tokens)
                     
                     spec_token_ids = filtered_spec_token_ids
-                    
-            # total_proposed = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
-            # torch.cuda.synchronize()
-            # execution_end_time = time.perf_counter()
-            # execution_duration = execution_end_time - execution_start_time
-            # self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
-            #                         scheduler_output.total_num_scheduled_tokens, early_return=False)
+                
 
+            # # # # 统计和控制 spec_token 数量（优先 hard，再分配 medium）
+            # if spec_token_ids is not None and distribution_aware:
+            #     hard_indices, medium_indices = self._get_hard_and_non_hard_indices()
 
-            # # # 统计和控制 spec_token 数量（优先 hard，再分配 medium）
-            if spec_token_ids is not None and distribution_aware:
-                hard_indices, medium_indices = self._get_hard_and_non_hard_indices()
-
-                # 先按 hard 分配，再将剩余分配给 medium，配额总量为 200
-                spec_token_ids = self._apply_quota_to_spec_tokens(
-                    spec_token_ids=spec_token_ids,
-                    hard_indices=hard_indices,
-                    non_hard_indices=medium_indices,
-                    quota=300,
-                )
+            #     # 先按 hard 分配，再将剩余分配给 medium，配额总量为 200
+            #     spec_token_ids = self._apply_quota_to_spec_tokens(
+            #         spec_token_ids=spec_token_ids,
+            #         hard_indices=hard_indices,
+            #         non_hard_indices=medium_indices,
+            #         quota=1000,
+            #     )
+            torch.cuda.synchronize()
+            cpu_execution_end_time = time.perf_counter()
+            cpu_execution_duration = cpu_execution_end_time - cpu_execution_start_time
+            self._log_execution_time(cpu_execution_start_timestamp, cpu_execution_duration, batch_size, 
+                                    scheduler_output.total_num_scheduled_tokens, early_return=False, doc_type="CPU_execution_time")
 
         # Clear KVConnector state after all KVs are generated.
         if has_kv_transfer_group():
@@ -957,24 +972,22 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             pass
 
         # Try request state attributes
-        try:
-            if req_id is not None and req_id in self.requests:
-                req_state = self.requests[req_id]
-                pid = getattr(req_state, "problem_id", None)
-                if isinstance(pid, bytes):
-                    pid = pid.decode()
-                if isinstance(pid, str):
-                    return pid
-                for container_name in ("inputs", "input", "meta", "meta_info", "request_kwargs", "extra", "extras"):
-                    container = getattr(req_state, container_name, None)
-                    if isinstance(container, dict) and "problem_id" in container:
-                        pid = container.get("problem_id")
-                        if isinstance(pid, bytes):
-                            pid = pid.decode()
-                        if isinstance(pid, str):
-                            return pid
-        except Exception:
-            pass
+
+        if req_id is not None and req_id in self.requests:
+            req_state = self.requests[req_id]
+            pid = getattr(req_state, "problem_id", None)
+            if isinstance(pid, bytes):
+                pid = pid.decode()
+            if isinstance(pid, str):
+                return pid
+            for container_name in ("inputs", "input", "meta", "meta_info", "request_kwargs", "extra", "extras"):
+                container = getattr(req_state, container_name, None)
+                if isinstance(container, dict) and "problem_id" in container:
+                    pid = container.get("problem_id")
+                    if isinstance(pid, bytes):
+                        pid = pid.decode()
+                    if isinstance(pid, str):
+                        return pid
 
         # Fallback: extract a common pattern from req_id
         if req_id is not None:
@@ -992,42 +1005,31 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         其他未列入者不分配配额。
         """
         # 优先使用已缓存的索引，以避免在 generate_sequences 的多次 execute_model 调用中重复计算
-        try:
-            if ProblemIdContextManager.has_hard_medium_indices():
-                cached_hard, cached_medium = ProblemIdContextManager.get_hard_medium_indices()
-                return cached_hard, cached_medium
-        except Exception:
-            pass
-
-        hard_indices: list[int] = []
-        medium_indices: list[int] = []
-
-        try:
-            hard_ids, medium_ids = ProblemIdContextManager.get_hard_medium_ids()
-        except Exception:
-            hard_ids, medium_ids = [], []
-        hard_set = set(str(pid) for pid in (hard_ids or []))
-        medium_set = set(str(pid) for pid in (medium_ids or []))
-
-        for i, req_id in enumerate(self.input_batch.req_ids):
-            problem_id = None
-            try:
+        if ProblemIdContextManager.has_hard_medium_indices():
+            cached_hard, cached_medium, cached_easy, cached_allowed_indices = ProblemIdContextManager.get_hard_medium_indices()
+            return cached_hard, cached_medium, cached_easy, cached_allowed_indices
+        else:
+            hard_indices: list[int] = []
+            medium_indices: list[int] = []  
+            easy_indices: list[int] = []
+            hard_ids, medium_ids,easy_ids = ProblemIdContextManager.get_hard_medium_ids()
+            hard_set = set(str(pid) for pid in (hard_ids or []))
+            medium_set = set(str(pid) for pid in (medium_ids or []))
+            easy_set = set(str(pid) for pid in (easy_ids or []))
+            for i, req_id in enumerate(self.input_batch.req_ids):
                 problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
-            except Exception:
-                pass
-            pid_str = str(problem_id)
-            if pid_str in hard_set:
-                hard_indices.append(i)
-            elif pid_str in medium_set:
-                medium_indices.append(i)
+                pid_str = str(problem_id)
+                if pid_str in hard_set:
+                    hard_indices.append(i)
+                elif pid_str in medium_set:
+                    medium_indices.append(i)
+                elif pid_str in easy_set:
+                    easy_indices.append(i)
+            allowed_indices = set(hard_indices) | set(medium_indices) | set(easy_indices)
 
-        # 缓存索引，供后续 execute_model 直接复用
-        try:
-            ProblemIdContextManager.set_hard_medium_indices(hard_indices, medium_indices)
-        except Exception:
-            pass
-
-        return hard_indices, medium_indices
+            ProblemIdContextManager.set_hard_medium_indices(hard_indices, medium_indices, easy_indices, allowed_indices)
+        
+        return hard_indices, medium_indices, easy_indices, allowed_indices
 
     def _apply_quota_to_spec_tokens(
         self,
@@ -1038,13 +1040,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     ) -> list:
         """
         在给定配额下调整 `spec_token_ids`：
-        - 仅保留 hard 与 medium（通过 non_hard_indices 传入）两类请求；
-        - 若 hard 请求总 tokens 超额，则按比例削减 hard，其他全部清空；
-        - 否则，先完整保留 hard，再将剩余配额按比例分配给 medium；
-        - 不在 hard/medium 中的请求其 tokens 一律清空。
+        - 优先保留 hard 请求；
+        - 若 hard 请求总 tokens 超额，则按比例削减 hard，并删除所有 non-hard；
+        - 否则，将剩余配额按比例分配给 non-hard。
         """
-        allowed_indices = set(hard_indices) | set(non_hard_indices)
-
         # 统计 hard 请求的 tokens 数量
         hard_spec_tokens = 0
         for i in hard_indices:
@@ -1053,24 +1052,22 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         if hard_spec_tokens > quota:
             keep_ratio = quota / max(1, hard_spec_tokens)
-            filtered_spec_token_ids = [[] for _ in range(len(spec_token_ids))]
-            for i in hard_indices:
-                if i < len(spec_token_ids) and spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
-                    keep_count = max(1, int(len(spec_token_ids[i]) * keep_ratio))
-                    filtered_spec_token_ids[i] = spec_token_ids[i][:keep_count]
+            filtered_spec_token_ids = []
+            for i in range(len(spec_token_ids)):
+                if i in hard_indices:
+                    if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
+                        keep_count = max(1, int(len(spec_token_ids[i]) * keep_ratio))
+                        filtered_tokens = spec_token_ids[i][:keep_count]
+                        filtered_spec_token_ids.append(filtered_tokens)
+                    else:
+                        filtered_spec_token_ids.append(spec_token_ids[i])
+                else:
+                    filtered_spec_token_ids.append([])
             return filtered_spec_token_ids
 
         remaining_quota = quota - hard_spec_tokens
 
-        # 初始化结果：默认全部清空，仅对 allowed_indices 赋值
-        filtered_spec_token_ids = [[] for _ in range(len(spec_token_ids))]
-
-        # 先完整保留 hard 请求（不超额时）
-        for i in hard_indices:
-            if i < len(spec_token_ids):
-                filtered_spec_token_ids[i] = spec_token_ids[i]
-
-        # 统计 medium（通过 non_hard_indices 传入）请求的 tokens 数量
+        # 统计 non-hard 请求的 tokens 数量
         non_hard_spec_tokens = 0
         for i in non_hard_indices:
             if i < len(spec_token_ids) and spec_token_ids[i] is not None:
@@ -1078,15 +1075,32 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         if non_hard_spec_tokens > 0 and remaining_quota > 0:
             non_hard_ratio = min(1.0, remaining_quota / max(1, non_hard_spec_tokens))
-            for i in non_hard_indices:
-                if i < len(spec_token_ids) and spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
-                    keep_count = max(0, int(len(spec_token_ids[i]) * non_hard_ratio))
-                    if keep_count > 0:
-                        filtered_spec_token_ids[i] = spec_token_ids[i][:keep_count]
+            filtered_spec_token_ids = []
+            for i in range(len(spec_token_ids)):
+                if i in hard_indices:
+                    filtered_spec_token_ids.append(spec_token_ids[i])
+                else:
+                    if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
+                        keep_count = max(0, int(len(spec_token_ids[i]) * non_hard_ratio))
+                        if keep_count > 0:
+                            filtered_tokens = spec_token_ids[i][:keep_count]
+                            filtered_spec_token_ids.append(filtered_tokens)
+                        else:
+                            filtered_spec_token_ids.append([])
+                    else:
+                        filtered_spec_token_ids.append(spec_token_ids[i])
             return filtered_spec_token_ids
 
-        # 无剩余配额或 medium 无 tokens 时，仅保留 hard，其余为空
-        return filtered_spec_token_ids
+        if remaining_quota <= 0:
+            filtered_spec_token_ids = []
+            for i in range(len(spec_token_ids)):
+                if i in hard_indices:
+                    filtered_spec_token_ids.append(spec_token_ids[i])
+                else:
+                    filtered_spec_token_ids.append([])
+            return filtered_spec_token_ids
+
+        return spec_token_ids
 
     def get_current_batch_problem_ids(self) -> list[Optional[str]]:
         """
@@ -1238,22 +1252,25 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     def _update_suffix_cache(self, sampled_token_ids: list[list[int]]) -> None:
         seen_req_ids = set()
         seen_problem_ids = set()
+        
+        # Check if distribution_aware mode is enabled
+        distribution_aware = bool(getattr(self.speculative_config, "distribution_aware", False))
+        
+        # Get hard and medium indices if distribution_aware is enabled
+        allowed_indices = None
+        if distribution_aware:
+            hard_indices, medium_indices, easy_indices, allowed_indices = self._get_hard_and_non_hard_indices()
+        
         for i, sampled_ids in enumerate(sampled_token_ids):
+            # Only update suffix cache for hard and medium problems when distribution_aware is enabled
+            if distribution_aware and allowed_indices is not None and i not in allowed_indices:
+                continue
+            if not sampled_ids:
+                continue
             req_id = self.input_batch.req_ids[i]
             problem_id = self.get_problem_id_by_request_id(req_id)
             seen_req_ids.add(req_id)
             seen_problem_ids.add(problem_id)
-
-            # # Only update suffix cache for hard problems (by problem_id)
-            # problem_id = self._get_problem_id_for_index(i)
-            # if not is_hard_problem(problem_id):
-            #     print(f"DEBUG: Skipping suffix cache update for non-hard problem req_id={req_id}, problem_id={problem_id}")
-            #     continue
-
-            if not sampled_ids:
-                continue
-
-            #print(f"DEBUG: Updating suffix cache for hard problem req_id={req_id}, sampled_ids={sampled_ids}")
             
             index = self.input_batch.req_id_to_index[req_id]
             if not self._suffix_cache.has_cached_prompt(req_id):
@@ -1266,8 +1283,111 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             #print(f"DEBUG: Updating response for req_id={req_id} with {len(sampled_ids)} tokens")
             self._suffix_cache.update_response(req_id, problem_id,sampled_ids)
 
+    def _process_task_batch_v2(self, task_batch):
+        """
+        🎯 优化：批处理多个speculation任务，增大并行粒度
+        
+        每个worker处理一批任务，减少线程调度和同步开销
+        
+        Args:
+            task_batch: 一批任务数据的列表
+            
+        Returns:
+            [(task_data, result), ...] 列表
+        """
+        from arctic_inference.common.suffix_cache import SuffixSpecResult
+        
+        batch_results = []
+        
+        for task_data in task_batch:
+            # 解包任务数据
+            (i, req_id, problem_id, pattern, spec_ids, config, end_idx, max_model_len, spec_len) = task_data
+            
+            # 准备pattern
+            if len(pattern) > config.suffix_cache_max_depth:
+                pattern = pattern[-config.suffix_cache_max_depth:]
+            
+            pattern = pattern + spec_ids
+            if len(pattern) > config.suffix_cache_max_depth:
+                pattern = pattern[-config.suffix_cache_max_depth:]
+            
+            # 计算参数
+            max_spec_tokens = min(
+                config.num_speculative_tokens if config.num_speculative_tokens is not None else config.suffix_cache_max_depth,
+                MAX_SPEC_LEN - len(spec_ids),
+                config.suffix_cache_max_depth,
+                max_model_len - end_idx - 1,
+                spec_len
+            )
+            
+            max_spec_factor = config.suffix_max_spec_factor
+            max_spec_offset = config.suffix_max_spec_offset - len(spec_ids) * (max_spec_factor + 1)
+            
+            # 🎯 使用预取的problem_tree对象
+            result = self._suffix_cache.speculate(
+            req_id,
+            problem_id,
+            pattern,
+            max_spec_tokens=max_spec_tokens,
+            max_spec_factor=max_spec_factor,
+            max_spec_offset=max_spec_offset,
+            min_token_prob=config.suffix_min_token_prob)
+            
+            batch_results.append((task_data, result))
+        
+        return batch_results
+    
+    def _process_single_speculation_v2(self, task_data):
+        """Process a single speculation request with pre-extracted data (NO shared state access)"""
+        import threading
+        thread_id = threading.current_thread().ident
+        start_time = time.perf_counter()
+        
+        (i, req_id, problem_id, pattern, spec_ids, config, end_idx, max_model_len) = task_data
+        
+        # All data is already extracted, no need to access self.input_batch!
+        if len(pattern) > config.suffix_cache_max_depth:
+            pattern = pattern[-config.suffix_cache_max_depth:]
+        
+        # Add spec_ids to pattern
+        pattern = pattern + spec_ids
+        if len(pattern) > config.suffix_cache_max_depth:
+            pattern = pattern[-config.suffix_cache_max_depth:]
+        
+        max_spec_tokens = min(
+            config.num_speculative_tokens if config.num_speculative_tokens is not None else config.suffix_cache_max_depth,
+            MAX_SPEC_LEN - len(spec_ids),
+            config.suffix_cache_max_depth,
+            max_model_len - end_idx - 1
+        )
+        max_spec_tokens = 5
+        
+        max_spec_factor = config.suffix_max_spec_factor
+        max_spec_offset = config.suffix_max_spec_offset - len(spec_ids) * (max_spec_factor + 1)
+        
+        #spec_start = time.perf_counter()
+        result = self._suffix_cache.speculate(
+            req_id,
+            problem_id,
+            pattern,
+            max_spec_tokens=max_spec_tokens,
+            max_spec_factor=max_spec_factor,
+            max_spec_offset=max_spec_offset,
+            min_token_prob=config.suffix_min_token_prob)
+        # spec_time = (time.perf_counter() - spec_start) * 1000
+        # total_time = (time.perf_counter() - start_time) * 1000
+        
+        # if total_time > 100:
+        #     print(f"[Task] thread={thread_id}, req_id={req_id}, spec={spec_time:.0f}ms, total={total_time:.0f}ms")
+        
+        return result
+    
     def _process_single_speculation(self, args):
-        """Process a single speculation request for parallel execution"""
+        """Process a single speculation request for parallel execution (OLD VERSION with shared state)"""
+        # import threading
+        # thread_id = threading.current_thread().ident
+        # start_time = time.perf_counter()
+        
         (i, sampled_ids, spec_ids, config) = args
         
         num_sampled_ids = len(sampled_ids)
@@ -1287,22 +1407,16 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         if end_idx >= self.max_model_len:
             return SuffixSpecResult()
 
-        # Check what's already at the position before writing
-        # existing_token = self.input_batch.token_ids_cpu[i, start_idx-6:start_idx].tolist() if start_idx < self.input_batch.token_ids_cpu.shape[1] else []
-        # print(f"DEBUG:start_idx: {start_idx}, end_idx: {end_idx}")
-        # print(f"DEBUG:existing_token: {existing_token}, sampled_ids: {sampled_ids}")
-        
-        # self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
-
         size = min(end_idx, config.suffix_cache_max_depth)
         pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx]
         pattern = pattern.tolist() + spec_ids
         if len(pattern) > config.suffix_cache_max_depth:
             pattern = pattern[-config.suffix_cache_max_depth:]
-        max_spec_tokens = min(config.num_speculative_tokens if config.num_speculative_tokens is not None else  config.suffix_cache_max_depth,
+        max_spec_tokens = min(config.num_speculative_tokens if config.num_speculative_tokens is not None else config.suffix_cache_max_depth,
                               MAX_SPEC_LEN - len(spec_ids),
                               config.suffix_cache_max_depth,
                               self.max_model_len - end_idx - 1)
+        max_spec_tokens = 5
         # max_spec_offset is modified to mimic the behavior of the original
         # max_spec_factor and max_spec_offset as if the speculative tokens
         # were generated by suffix decoding. For example, if:
@@ -1318,6 +1432,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         max_spec_factor = config.suffix_max_spec_factor
         max_spec_offset = (config.suffix_max_spec_offset - len(spec_ids) *
                            (max_spec_factor + 1))
+        #spec_start = time.perf_counter()
         result = self._suffix_cache.speculate(
             req_id,
             problem_id,
@@ -1326,6 +1441,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             max_spec_factor=max_spec_factor,
             max_spec_offset=max_spec_offset,
             min_token_prob=config.suffix_min_token_prob)
+        #spec_time = (time.perf_counter() - spec_start) * 1000
+        #total_time = (time.perf_counter() - start_time) * 1000
+        
+        # # Log每个任务的执行情况（只记录慢的）
+        # if total_time > 100:
+        #     print(f"[Task] thread={thread_id}, req_id={req_id}, spec={spec_time:.0f}ms, total={total_time:.0f}ms")
 
         # # Debug output - capture match and spec token information
         if hasattr(self, '_debug_spec_file') and self._debug_spec_file:
@@ -1403,49 +1524,159 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         
         # Determine which indices are allowed (hard and medium only)
         try:
-            hard_indices, medium_indices = self._get_hard_and_non_hard_indices()
-        except Exception:
-            hard_indices, medium_indices = [], []
-        allowed_indices = set(hard_indices) | set(medium_indices)
+            hard_indices, medium_indices, easy_indices, allowed_indices = self._get_hard_and_non_hard_indices()
+        except Exception as e:
+            print(f"Error getting hard and non-hard indices: {e}")
+            hard_indices, medium_indices, easy_indices, allowed_indices = [], [], [], []
 
-        # Pre-initialize results for all requests; default is empty for non-allowed
-        results: list[SuffixSpecResult] = [SuffixSpecResult() for _ in range(len(sampled_token_ids))]
+        if len(allowed_indices) > 0:
+            # Case (1): Only process hard/medium; others return empty
+            results: list[SuffixSpecResult] = [SuffixSpecResult() for _ in range(len(sampled_token_ids))]
+            # 🚀 Use persistent thread pool to avoid repeated creation overhead
+            self._speculation_max_workers = 9
+            if self._speculation_threadpool is None:
+                self._speculation_threadpool = ThreadPoolExecutor(max_workers=self._speculation_max_workers)
+                print(f"[ThreadPool] Created with {self._speculation_max_workers} workers")
+            
+            
+            # 🚀 Pre-extract all data to avoid shared state access in threads
+            # batch_start = time.perf_counter()
+            # extract_start = time.perf_counter()
+            prepared_tasks = []
+            hard_spec, medium_spec, easy_spec = 16, 8, 3
+            for i in hard_indices:
+                if 0 <= i < len(sampled_token_ids):
+                    sampled_ids = sampled_token_ids[i]
+                    spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+                    req_id = self.input_batch.req_ids[i]
+                    end_idx = self.input_batch.num_tokens_no_spec[i]
+                    if end_idx >= self.max_model_len:
+                        continue
+                    size = min(end_idx, config.suffix_cache_max_depth)
+                    pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx].tolist()
+                    problem_id = self.get_problem_id_by_request_id(req_id)
+                    
+                    # Pack everything into a self-contained tuple
+                    prepared_tasks.append((
+                        i, req_id, problem_id, pattern, spec_ids, 
+                        config, end_idx, self.max_model_len, hard_spec
+                    ))
 
-        # Build tasks only for allowed indices
-        tasks = []
-        for i in sorted(allowed_indices):
-            if 0 <= i < len(sampled_token_ids):
-                sampled_ids = sampled_token_ids[i]
-                spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
-                tasks.append((i, sampled_ids, spec_ids, config))
+            for i in medium_indices:
+                if 0 <= i < len(sampled_token_ids):
+                    sampled_ids = sampled_token_ids[i]
+                    spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+                    req_id = self.input_batch.req_ids[i]
+                    end_idx = self.input_batch.num_tokens_no_spec[i]
+                    if end_idx >= self.max_model_len:
+                        continue
+                    size = min(end_idx, config.suffix_cache_max_depth)
+                    pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx].tolist()
+                    problem_id = self.get_problem_id_by_request_id(req_id)
+                    prepared_tasks.append((
+                        i, req_id, problem_id, pattern, spec_ids, 
+                        config, end_idx, self.max_model_len, medium_spec
+                    ))
+            for i in easy_indices:
+                if 0 <= i < len(sampled_token_ids):
+                    sampled_ids = sampled_token_ids[i]
+                    spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+                    req_id = self.input_batch.req_ids[i]
+                    end_idx = self.input_batch.num_tokens_no_spec[i]
+                    if end_idx >= self.max_model_len:
+                        continue
+                    size = min(end_idx, config.suffix_cache_max_depth)
+                    pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx].tolist()
+                    problem_id = self.get_problem_id_by_request_id(req_id)
+                    prepared_tasks.append((
+                        i, req_id, problem_id, pattern, spec_ids, 
+                        config, end_idx, self.max_model_len, easy_spec
+                    ))
 
-        if not tasks:
+            if not prepared_tasks:
+                return results
+            
+            # 🎯 优化：增大并行粒度 - 将多个小任务合并成批处理任务
+            # 将任务按worker数量分组，每个worker处理一批任务
+            num_workers = self._speculation_max_workers
+            task_groups = [[] for _ in range(num_workers)]
+            
+            # 循环分配任务到各个worker组（负载均衡）
+            # submit_start = time.perf_counter()
+            for i, task_data in enumerate(prepared_tasks):
+                worker_id = i % num_workers
+                task_groups[worker_id].append(task_data)
+            # submit_time = time.perf_counter() - submit_start
+            # 过滤掉空组
+            non_empty_groups = [group for group in task_groups if group]
+            
+            # 提交批处理任务
+            future_to_group = {}
+            for group in non_empty_groups:
+                future = self._speculation_threadpool.submit(self._process_task_batch_v2, group)
+                future_to_group[future] = group
+            
+            # 收集结果
+            completed = 0
+            # wait_start = time.perf_counter()
+            for future in future_to_group:
+                try:
+                    batch_results = future.result()  # 返回的是一个列表
+                    for task_data, result in batch_results:
+                        req_index = task_data[0]
+                        results[req_index] = result
+                        completed += 1
+                except Exception as e:
+                    print(f"[Error] processing batch: {e}")
+                    # Fallback: 对这个批次的所有任务返回空结果
+                    group = future_to_group[future]
+                    for task_data in group:
+                        req_index = task_data[0]
+                        results[req_index] = SuffixSpecResult()
             return results
+        else:
+            # Case (2): Fallback to previous implementation (process all)            
+            # Extract phase: prepare batch args
+            batch_args = []
+            for i, sampled_ids in enumerate(sampled_token_ids):
+                spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+                batch_args.append((i, sampled_ids, spec_ids, config))
 
-        # Use ThreadPoolExecutor for parallel processing
-        max_workers = min(len(tasks), getattr(self._suffix_cache, '_max_threads', 4))
-        
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future_to_index = {executor.submit(self._process_single_speculation, args): i 
-                               for (i, *_), args in zip([t for t in tasks], tasks)}
+            # 🚀 Use persistent thread pool to avoid repeated creation overhead
+            if self._speculation_threadpool is None:
+                self._speculation_threadpool = ThreadPoolExecutor(max_workers=self._speculation_max_workers)
+            
+            # Submit phase
+            submit_start = time.perf_counter()
+            future_to_index = {self._speculation_threadpool.submit(self._process_single_speculation, args): i 
+                              for i, args in enumerate(batch_args)}
+
+            results = [None] * len(batch_args)
             for future in future_to_index:
                 index = future_to_index[future]
                 try:
                     results[index] = future.result()
                 except Exception as e:
                     print(f"Error processing speculation for index {index}: {e}")
-                    results[index] = SuffixSpecResult()
+                    results[index] = SuffixSpecResult()  # Fallback to empty result
 
-        return results
+            return results
 
 
 
     def __del__(self):
-        """Clean up debug files when model runner is destroyed"""
+        """Clean up debug files and thread pool when model runner is destroyed"""
         if hasattr(self, '_debug_spec_file') and self._debug_spec_file:
             try:
                 self._debug_spec_file.close()
                 self._debug_spec_file = None
+            except:
+                pass
+        
+        # Shutdown the persistent thread pool
+        if hasattr(self, '_speculation_threadpool') and self._speculation_threadpool:
+            try:
+                self._speculation_threadpool.shutdown(wait=False)
             except:
                 pass
 
@@ -1567,7 +1798,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             for mod in self.shift_model.modules():
                 if isinstance(mod, Attention):
                     mod.kv_cache = forward_context[mod.layer_name].kv_cache
-    def _log_execution_time(self, start_timestamp, duration_seconds, batch_size, num_scheduled_tokens,early_return=False):
+    def _log_execution_time(self, start_timestamp, duration_seconds, batch_size, num_scheduled_tokens,early_return=False, doc_type: str = "GPU_execution_time"):
         """Log execution time metrics for execute_model calls"""
         try:
             timing_data = {
@@ -1586,46 +1817,107 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             }
             
             # Write to file
-            self._write_timing_stats(timing_data)
+            self._write_timing_stats(timing_data, doc_type=doc_type)
             
         except Exception as e:
             # Log error but don't crash the model
             logger.error(f"Failed to log execution time: {e}")
     
-    def _write_timing_stats(self, timing_data):
+    def _write_timing_stats(self, timing_data, doc_type: str = "GPU_execution_time"):
         """Buffer execution timing data and flush periodically to reduce I/O."""
-        try:
-            # Enqueue timing data
-            self._timing_buffer.append(json.dumps(timing_data, default=self._json_serializable))
+        if doc_type == "GPU_execution_time":
+            buffer = self._gpu_timing_buffer
+            buffer.append(json.dumps(timing_data, default=self._json_serializable))
+        elif doc_type == "CPU_execution_time":
+            buffer = self._cpu_timing_buffer
+            buffer.append(json.dumps(timing_data, default=self._json_serializable))
+        else:
+            raise ValueError(f"Invalid document type: {doc_type}")
+        
+        # Flush conditions: buffer size or time threshold
+        should_flush_by_n = len(buffer) >= self._timing_flush_every_n
+        should_flush_by_time = (time.monotonic() - self._timing_last_flush_time[doc_type]) >= self._timing_flush_every_s
+        if should_flush_by_n or should_flush_by_time:
+            self._flush_timing_buffer(doc_type=doc_type)
 
-            # Flush conditions: buffer size or time threshold
-            should_flush_by_n = len(self._timing_buffer) >= self._timing_flush_every_n
-            if should_flush_by_n:
-                self._flush_timing_buffer()
-        except Exception as e:
-            logger.error(f"Failed to buffer timing stats: {e}")
-
-    def _flush_timing_buffer(self, force: bool = False):
+    def _flush_timing_buffer(self, force: bool = False, doc_type: str = "GPU_execution_time"):
         """Flush buffered timing lines to disk.
 
         When force is True, flush unconditionally (e.g., at exit).
         """
         try:
-            if not self._timing_buffer and not force:
+            if doc_type == "GPU_execution_time":
+                buffer = self._gpu_timing_buffer
+                file_type = "GPU_execution_timing"
+            elif doc_type == "CPU_execution_time":
+                buffer = self._cpu_timing_buffer
+                file_type = "CPU_execution_timing"
+            else:
+                raise ValueError(f"Invalid document type: {doc_type}")
+            if not buffer and not force:
                 return
             # Nothing to write if empty and not forced
-            if not self._timing_buffer:
-                self._timing_last_flush_time = time.monotonic()
+            if not buffer:
+                self._timing_last_flush_time[doc_type] = time.monotonic()
                 return
 
+            # Get file path with current_step included
+            file_path = self._get_file_path_with_step(file_type)
+            
             # Write all pending lines at once
-            with open(self._timing_file_path, "a") as f:
-                f.write("\n".join(self._timing_buffer) + "\n")
-            self._timing_buffer.clear()
-            self._timing_last_flush_time = time.monotonic()
+            with open(file_path, "a") as f:
+                f.write("\n".join(buffer) + "\n")
+            buffer.clear()
+            self._timing_last_flush_time[doc_type] = time.monotonic()
         except Exception as e:
             logger.error(f"Failed to flush timing stats: {e}")
 
+    def _get_file_path_with_step(self, file_type: str) -> str:
+        """Generate file path with current_step in the filename.
+        
+        Args:
+            file_type: Type of file - "GPU_execution_timing", "CPU_execution_timing", 
+                      "suffix_tree_stats", "suffix_speculation_timing", or "token_data"
+        
+        Returns:
+            File path with current_step in the filename if available, otherwise the default path
+        """
+        import os as _os
+        
+        # Get current_step from context manager
+        current_step = None
+        
+        # If current_step is not available, return the default path without step suffix
+        if current_step is None:
+            if file_type == "GPU_execution_timing":
+                return self._timing_file_path_gpu
+            elif file_type == "CPU_execution_timing":
+                return self._timing_file_path_cpu
+            elif file_type == "suffix_tree_stats":
+                return self._suffix_file_path
+            elif file_type == "suffix_speculation_timing":
+                return self._suffix_timing_file_path
+            elif file_type == "token_data":
+                # Default token_data path when current_step is not available
+                return _os.path.join(self._output_dir, f"token_data_rank_{self._rank}_local_{self._local_rank}.jsonl")
+            else:
+                raise ValueError(f"Unknown file_type: {file_type}")
+        
+        # Generate filename with current_step
+        if file_type == "GPU_execution_timing":
+            filename = f"GPU_execution_timing_rank_{self._rank}.jsonl"
+        elif file_type == "CPU_execution_timing":
+            filename = f"CPU_execution_timing_rank_{self._rank}.jsonl"
+        elif file_type == "suffix_tree_stats":
+            filename = f"suffix_tree_stats_rank_{self._rank}.jsonl"
+        elif file_type == "suffix_speculation_timing":
+            filename = f"suffix_speculation_timing_rank_{self._rank}.jsonl"
+        elif file_type == "token_data":
+            filename = f"token_data_rank_{self._rank}.jsonl"
+        else:
+            raise ValueError(f"Unknown file_type: {file_type}")
+        
+        return _os.path.join(self._output_dir, filename)
     
     def _json_serializable(self, obj):
         """Convert numpy types and other non-serializable objects to JSON-serializable types"""
@@ -1654,13 +1946,55 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 self._suffix_last_flush_time = time.monotonic()
                 return
 
+            # Get file path with current_step included
+            file_path = self._get_file_path_with_step("suffix_tree_stats")
+            
             # Write all pending lines at once
-            with open(self._suffix_file_path, "a") as f:
+            with open(file_path, "a") as f:
                 f.write("\n".join(self._suffix_buffer) + "\n")
             self._suffix_buffer.clear()
             self._suffix_last_flush_time = time.monotonic()
         except Exception as e:
             logger.error(f"Failed to flush suffix-tree stats: {e}")
+    
+    def _flush_suffix_timing_buffer(self, force: bool = False):
+        """Flush buffered suffix speculation timing lines to disk.
+
+        When force is True, flush unconditionally (e.g., at exit).
+        """
+        try:
+            if not self._suffix_timing_buffer and not force:
+                return
+            # Nothing to write if empty and not forced
+            if not self._suffix_timing_buffer:
+                self._suffix_timing_last_flush_time = time.monotonic()
+                return
+
+            # Get file path with current_step included
+            file_path = self._get_file_path_with_step("suffix_speculation_timing")
+            
+            # Write all pending lines at once
+            with open(file_path, "a") as f:
+                f.write("\n".join(self._suffix_timing_buffer) + "\n")
+            self._suffix_timing_buffer.clear()
+            self._suffix_timing_last_flush_time = time.monotonic()
+        except Exception as e:
+            logger.error(f"Failed to flush suffix timing stats: {e}")
+    
+    def _write_suffix_timing_stats(self, timing_data):
+        """Buffer suffix speculation timing data and flush periodically to reduce I/O."""
+        try:
+            # Enqueue timing data
+            self._suffix_timing_buffer.append(json.dumps(timing_data, default=self._json_serializable))
+
+            # Flush conditions: buffer size or time threshold
+            should_flush_by_n = len(self._suffix_timing_buffer) >= self._suffix_timing_flush_every_n
+            should_flush_by_time = (time.monotonic() - self._suffix_timing_last_flush_time) >= self._suffix_timing_flush_every_s
+            if should_flush_by_n or should_flush_by_time:
+                self._flush_suffix_timing_buffer()
+        except Exception as e:
+            # Log error but don't crash the model
+            logger.error(f"Failed to buffer suffix timing stats: {e}")
 
     def _log_suffix_tree_stats(self, num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids):
         """Log suffix tree decoding statistics for this execute_model call"""
@@ -1782,16 +2116,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     def _write_token_data(self, token_data):
         """Write draft and valid token data to a separate file"""
         try:
-            # Use environment variable for output directory
-            output_dir = os.getenv("ARCTIC_METRICS_DIR", "/app/src")
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Get process info for filename
-            local_rank = os.getenv("LOCAL_RANK", "0")
-            rank = os.getenv("RANK", "0")
-            
-            # Create separate files for each process to avoid conflicts
-            token_file = os.path.join(output_dir, f"token_data_rank_{rank}_local_{local_rank}.jsonl")
+            # Get file path with current_step included
+            token_file = self._get_file_path_with_step("token_data")
             
             # Write with immediate flush to ensure data is written atomically
             with open(token_file, "a") as f:

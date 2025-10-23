@@ -57,7 +57,6 @@ def apply_llm_patches():
             # If problem_ids provided, initialize context
             if problem_ids is not None:
                 # Clear any existing mapping and set up new context
-                ProblemIdContextManager.clear_req_id_mapping()
                 ProblemIdContextManager.set_current_batch_problem_ids(problem_ids)
                 logger.debug(f"Setting up problem_ids context with {len(problem_ids)} IDs")
             else:

@@ -20,6 +20,10 @@ from typing import Hashable, List, Optional, Sequence, Union, Tuple
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc
+import multiprocessing as mp
+import os
+import sys
 
 try:
     from tqdm import tqdm
@@ -93,7 +97,18 @@ class SuffixCache:
         # Thread safety lock for shared dictionary access
         self._dict_lock = threading.Lock() if thread_safe else None
         
+        # 🧹 Background cleanup infrastructure (Queue + Thread, like prebuild)
+        import queue
+        self._cleanup_queue = queue.Queue()
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop,
+            name="suffix-cache-cleanup",
+            daemon=True
+        )
+        self._cleanup_thread.start()
+        
         print(f"SuffixCache initialized: thread_safe={thread_safe}, max_threads={self._max_threads}")
+        print(f"SuffixCache: Background cleanup thread started")
 
     @property
     def max_depth(self) -> int:
@@ -180,34 +195,179 @@ class SuffixCache:
             raise ValueError(f"Prompt does not exist for request '{problem_id}'")
         del self._problem_tree[problem_id]
 
-    def clear_all_cache(self):
+    def _cleanup_loop(self):
+        """🧹 Background cleanup loop (runs in daemon thread, like prebuild loop)"""
+        import queue as q
+        while True:
+            try:
+                task = self._cleanup_queue.get()  # 阻塞等待清理任务
+                
+                old_problem_tree = task["old_problem_tree"]
+                old_prompt_trees = task["old_prompt_trees"]
+                old_req_to_seq_id = task["old_req_to_seq_id"]
+                num_problem_trees = task["num_problem_trees"]
+                num_prompt_trees = task["num_prompt_trees"]
+                
+                print(f"DEBUG: [Cleanup Thread] Starting cleanup of {num_problem_trees} problem trees, {num_prompt_trees} prompt trees")
+                start_time = time.time()
+                
+                # Clear old caches (slow part, ~100s)
+                old_problem_tree.clear()
+                old_prompt_trees.clear()
+                old_req_to_seq_id.clear()
+                
+                # Force GC
+                gc.collect()
+                
+                elapsed = time.time() - start_time
+                print(f"DEBUG: [Cleanup Thread] ✅ Cleanup completed in {elapsed:.3f}s")
+                
+                self._cleanup_queue.task_done()
+                
+            except Exception as e:
+                print(f"ERROR: [Cleanup Thread] Cleanup failed: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    def clear_all_cache(self, use_background_thread: bool = False):
         """
         Clear all cached data in the suffix cache to free up memory.
-        This includes all problem trees, prompt trees, and request-to-sequence mappings.
+        Uses Queue + Thread pattern (same as prebuild).
+        
+        Args:
+            use_background_thread: If True, enqueue cleanup to background thread (non-blocking).
+                                  If False, perform synchronous cleanup.
         """
-        # Clear all problem trees (C++ SuffixTree objects)
-        problem_ids_to_clear = list(self._problem_tree.keys())
-        for problem_id in problem_ids_to_clear:
-            try:
-                del self._problem_tree[problem_id]
-            except KeyError:
-                pass  # Already cleared
+        num_problem_trees = len(self._problem_tree)
+        num_prompt_trees = len(self._prompt_trees)
+        
+        if use_background_thread:
+            # 🚀 Enqueue cleanup task (non-blocking, like prebuild)
+            print(f"DEBUG: [Main] Enqueueing cleanup task: {num_problem_trees} problem trees, {num_prompt_trees} prompt trees")
+            
+            # Move references to task dict
+            task = {
+                "old_problem_tree": self._problem_tree,
+                "old_prompt_trees": self._prompt_trees,
+                "old_req_to_seq_id": self._req_to_seq_id,
+                "num_problem_trees": num_problem_trees,
+                "num_prompt_trees": num_prompt_trees,
+            }
+            
+            # Create new empty caches
+            self._problem_tree = {}
+            self._prompt_trees = {}
+            self._req_to_seq_id = {}
+            
+            # Enqueue task (立即返回！)
+            self._cleanup_queue.put_nowait(task)
+            
+            print(f"DEBUG: [Main] Cleanup task enqueued, returning immediately")
+            return {"success": True, "method": "background_thread"}
+        
+        # Synchronous cleanup
         self._problem_tree.clear()
-        
-        # Clear all prompt trees (C++ SuffixTree objects)  
-        prompt_req_ids_to_clear = list(self._prompt_trees.keys())
-        for req_id in prompt_req_ids_to_clear:
-            try:
-                del self._prompt_trees[req_id]
-            except KeyError:
-                pass  # Already cleared
         self._prompt_trees.clear()
-        
-        # Clear request to sequence ID mapping
         self._req_to_seq_id.clear()
         
-        print(f"DEBUG: Cleared all suffix cache data - {len(problem_ids_to_clear)} problem trees, "
-              f"{len(prompt_req_ids_to_clear)} prompt trees, and req_to_seq_id mapping")
+        print(f"DEBUG: Cleared all suffix cache data - {num_problem_trees} problem trees, "
+              f"{num_prompt_trees} prompt trees, and req_to_seq_id mapping")
+        return {"success": True, "method": "synchronous"}
+    
+    def _clear_all_cache_background_process(self):
+        """
+        ⚡ Fork a background process to clean up cache in parallel with main process.
+        
+        This leverages Linux fork's copy-on-write mechanism:
+        1. Fork creates child process that inherits parent's memory (including C++ objects)
+        2. Parent immediately creates new empty caches and continues
+        3. Child slowly cleans up the old caches (with its own GIL, no blocking!)
+        4. Child process exits when done
+        
+        Returns immediately without blocking main process.
+        """
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        
+        # Get counts before clearing
+        num_problem_trees = len(self._problem_tree)
+        num_prompt_trees = len(self._prompt_trees)
+        
+        if num_problem_trees == 0 and num_prompt_trees == 0:
+            print(f"DEBUG: [{timestamp}] No cache to clean, skipping background cleanup")
+            return None
+        
+        print(f"DEBUG: [{timestamp}] [Parent PID={os.getpid()}] Starting background process cleanup")
+        print(f"DEBUG: [{timestamp}] Cache size: {num_problem_trees} problem trees, {num_prompt_trees} prompt trees")
+        
+        # 🔑 Key: Move references to local variables
+        # After fork, both parent and child will have these references
+        time_move_refs = time.time()
+        old_problem_tree = self._problem_tree
+        old_prompt_trees = self._prompt_trees
+        old_req_to_seq_id = self._req_to_seq_id
+        print(f"DEBUG: [{timestamp}] Moved references in {(time.time() - time_move_refs)*1000:.1f}ms")
+        
+        # Parent creates new empty caches BEFORE fork
+        # This way, parent can immediately start using new caches
+        time_new_caches = time.time()
+        self._problem_tree = {}
+        self._prompt_trees = {}
+        self._req_to_seq_id = {}
+        print(f"DEBUG: [{timestamp}] Created new empty caches in {(time.time() - time_new_caches)*1000:.1f}ms")
+        
+        # 🚀 使用 os.fork() 直接 fork，避免 multiprocessing 的所有开销
+        # multiprocessing.Process 有隐式同步机制，会导致父进程阻塞
+        time_fork_start = time.time()
+        
+        print(f"DEBUG: [{timestamp}] [Parent PID={os.getpid()}] About to os.fork()...")
+        
+        child_pid = os.fork()
+        
+        if child_pid == 0:
+            # ========== 子进程代码 ==========
+            # 这部分在子进程中执行
+            child_pid_actual = os.getpid()
+            print(f"DEBUG: [{timestamp}] [Child PID={child_pid_actual}] Background cleanup started")
+            start_time = time.time()
+            
+            try:
+                # Clear old caches (this is the slow part, ~100s)
+                print(f"DEBUG: [{timestamp}] [Child PID={child_pid_actual}] Clearing {len(old_problem_tree)} problem trees...")
+                old_problem_tree.clear()
+                
+                print(f"DEBUG: [{timestamp}] [Child PID={child_pid_actual}] Clearing {len(old_prompt_trees)} prompt trees...")
+                old_prompt_trees.clear()
+                
+                old_req_to_seq_id.clear()
+                
+                # Force garbage collection
+                print(f"DEBUG: [{timestamp}] [Child PID={child_pid_actual}] Running gc.collect()...")
+                gc.collect()
+                
+                elapsed = time.time() - start_time
+                print(f"DEBUG: [{timestamp}] [Child PID={child_pid_actual}] ✅ Background cleanup completed in {elapsed:.3f}s - "
+                      f"{num_problem_trees} problem trees, {num_prompt_trees} prompt trees")
+                
+            except Exception as e:
+                print(f"ERROR: [{timestamp}] [Child PID={child_pid_actual}] Background cleanup failed: {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
+            finally:
+                # Child process exits
+                print(f"DEBUG: [{timestamp}] [Child PID={child_pid_actual}] Child process exiting")
+                os._exit(0)  # 使用 os._exit() 避免触发 atexit 回调
+        
+        # ========== 父进程代码 ==========
+        # child_pid > 0，这是父进程
+        fork_time = time.time() - time_fork_start
+        print(f"DEBUG: [{timestamp}] ⚡ os.fork() took {fork_time*1000:.1f}ms")
+        print(f"DEBUG: [{timestamp}] [Parent PID={os.getpid()}] ⚡ Forked child process (PID={child_pid})")
+        print(f"DEBUG: [{timestamp}] [Parent] Returning immediately, cleanup in child process")
+        print(f"DEBUG: [{timestamp}] [Parent] About to return, total elapsed={(time.time() - time_fork_start)*1000:.1f}ms")
+        
+        # 父进程立即返回，不等待子进程
+        return {"success": True, "pid": child_pid}
 
     def _get_or_assign_seq_id(self, req_id: Hashable) -> int:
         if req_id not in self._req_to_seq_id:
@@ -355,7 +515,6 @@ class SuffixCache:
 
         if max_spec_tokens is None:
             max_spec_tokens = self.max_depth
-        #max_spec_tokens = 8
 
         if len(pattern) > self._max_depth:
             pattern = pattern[-self._max_depth :]
@@ -465,40 +624,40 @@ class SuffixCache:
                               desc="Building with C++ object-level locking"):
                 results.append(future.result())
         
-        total_time = time.perf_counter() - start_time
+        # total_time = time.perf_counter() - start_time
         
-        # Aggregate statistics
-        total_processed = sum(r['processed'] for r in results)
-        total_operations = sum(r['operations'] for r in results)
-        thread_times = [r['time'] for r in results]
+        # # Aggregate statistics
+        # total_processed = sum(r['processed'] for r in results)
+        # total_operations = sum(r['operations'] for r in results)
+        # thread_times = [r['time'] for r in results]
         
-        parallel_time = max(thread_times) if thread_times else 0.0
-        sequential_equivalent_time = sum(thread_times)  # Time if executed sequentially
-        theoretical_speedup = sequential_equivalent_time / parallel_time if parallel_time > 0 else 1.0
-        actual_speedup = sequential_equivalent_time / total_time if total_time > 0 else 1.0
+        # parallel_time = max(thread_times) if thread_times else 0.0
+        # sequential_equivalent_time = sum(thread_times)  # Time if executed sequentially
+        # theoretical_speedup = sequential_equivalent_time / parallel_time if parallel_time > 0 else 1.0
+        # actual_speedup = sequential_equivalent_time / total_time if total_time > 0 else 1.0
         
-        print(f"🚀 C++ Object-Level Locking Results:")
-        print(f"  Total time: {total_time:.4f}秒")
-        print(f"  Parallel time: {parallel_time:.4f}秒")
-        print(f"  Processed problems: {total_processed}")
-        print(f"  Total operations: {total_operations}")
-        print(f"  Theoretical speedup: {theoretical_speedup:.2f}x")
-        print(f"  Actual speedup: {actual_speedup:.2f}x")
-        print(f"  Active threads: {len(results)}")
-        print(f"  ✅ Each SuffixTree had independent C++ mutex + GIL release")
+        # print(f"🚀 C++ Object-Level Locking Results:")
+        # print(f"  Total time: {total_time:.4f}秒")
+        # print(f"  Parallel time: {parallel_time:.4f}秒")
+        # print(f"  Processed problems: {total_processed}")
+        # print(f"  Total operations: {total_operations}")
+        # print(f"  Theoretical speedup: {theoretical_speedup:.2f}x")
+        # print(f"  Actual speedup: {actual_speedup:.2f}x")
+        # print(f"  Active threads: {len(results)}")
+        # print(f"  ✅ Each SuffixTree had independent C++ mutex + GIL release")
         
-        return {
-            "method": f"cpp_object_locking_{self._max_threads}",
-            "total_problems": len(problems_data),
-            "successful_problems": total_processed,
-            "total_operations": total_operations,
-            "total_time": total_time,
-            "parallel_time": parallel_time,
-            "theoretical_speedup": theoretical_speedup,
-            "actual_speedup": actual_speedup,
-            "active_threads": len(results),
-            "thread_safe": True
-        }
+        # return {
+        #     "method": f"cpp_object_locking_{self._max_threads}",
+        #     "total_problems": len(problems_data),
+        #     "successful_problems": total_processed,
+        #     "total_operations": total_operations,
+        #     "total_time": total_time,
+        #     "parallel_time": parallel_time,
+        #     "theoretical_speedup": theoretical_speedup,
+        #     "actual_speedup": actual_speedup,
+        #     "active_threads": len(results),
+        #     "thread_safe": True
+        # }
     
     def _build_problems_serial(self, problems_data: List[Tuple[Hashable, List[int], List[List[int]]]]) -> dict:
         """Fallback serial processing method"""

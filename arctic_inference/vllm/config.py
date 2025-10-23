@@ -108,7 +108,6 @@ class SpeculativeConfigPatch(ArcticPatch[SpeculativeConfig]):
         if use_suffix:
             self.method = "suffix"
             self.enable_suffix_decoding = True
-            self.num_speculative_tokens = self.suffix_cache_max_depth
             self._verify_args()
         else:
             self._orig_post_init()

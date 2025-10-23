@@ -530,15 +530,15 @@ def main(args: argparse.Namespace):
     if args.tokenizer is not None:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
         
-    # # Tokenize datasets (if needed)
-    if args.tokenizer is not None:
-        dataset = tokenize_data(dataset, args.tokenizer)
-        if train_dataset is not None:
-            train_dataset = tokenize_data(train_dataset, args.tokenizer)
-    else:
-        ensure_tokenized(dataset)
-        if train_dataset is not None:
-            ensure_tokenized(train_dataset)
+    # # # Tokenize datasets (if needed)
+    # if args.tokenizer is not None:
+    #     dataset = tokenize_data(dataset, args.tokenizer)
+    #     if train_dataset is not None:
+    #         train_dataset = tokenize_data(train_dataset, args.tokenizer)
+    # else:
+    #     ensure_tokenized(dataset)
+    #     if train_dataset is not None:
+    #         ensure_tokenized(train_dataset)
     # Create all possible configurations
     num_eval = args.num_eval or [None]
     num_train = args.num_train or [None]
@@ -635,13 +635,13 @@ def get_parser():
     parser.add_argument(
         "--prompt-column",
         type=str,
-        default="input",
+        default="input_token_ids",
         help="Column name for the prompts in the dataset",
     )
     parser.add_argument(
         "--response-column",
         type=str,
-        default="output",
+        default="output_token_ids",
         help="Column name for the responses in the dataset",
     )
     parser.add_argument(

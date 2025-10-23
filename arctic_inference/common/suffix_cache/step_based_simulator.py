@@ -371,8 +371,14 @@ def tokenize_text_data(df: pd.DataFrame, tokenizer_name: str) -> pd.DataFrame:
     responses: List[List[int]] = []
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Tokenizing data"):
-        prompts.append(tokenizer.encode(row["input"]))
-        responses.append(tokenizer.encode(row["output"]))
+        if "input_token_ids" in row:
+            prompts.append(row["input_token_ids"])
+        else:
+            prompts.append(tokenizer.encode(row["input"]))
+        if "output_token_ids" in row:
+            responses.append(row["output_token_ids"])
+        else:
+            responses.append(tokenizer.encode(row["output"]))
 
     result_df = df.copy()
     result_df["prompt"] = prompts
@@ -601,7 +607,7 @@ def main():
     parser.add_argument(
         "--window-size",
         type=int,
-        default=4,
+        default=16,
         help="Window size for filtering prior steps"
     )
     parser.add_argument(
