@@ -520,19 +520,19 @@ class SuffixCache:
             pattern = pattern[-self._max_depth :]
         
         result = SuffixSpecResult()        
-        if use_cached_prompt:
-            prompt_tree = self._prompt_trees[req_id]
-            # Use thread-safe speculate if available (though speculate is typically read-only)
-            candidate = prompt_tree.speculate(
-                pattern,
-                max_spec_tokens,
-                max_spec_factor,
-                max_spec_offset,
-                min_token_prob,
-                use_tree_spec)
-            result = SuffixSpecResult.from_candidate(candidate)
-        else:
-            result = SuffixSpecResult()
+        # if use_cached_prompt:
+        #     prompt_tree = self._prompt_trees[req_id]
+        #     # Use thread-safe speculate if available (though speculate is typically read-only)
+        #     candidate = prompt_tree.speculate(
+        #         pattern,
+        #         max_spec_tokens,
+        #         max_spec_factor,
+        #         max_spec_offset,
+        #         min_token_prob,
+        #         use_tree_spec)
+        #     result = SuffixSpecResult.from_candidate(candidate)
+        # else:
+        #     result = SuffixSpecResult()
 
         # Thread-safe access to problem tree (no need for _safe method as speculate is read-only)
         if problem_id in self._problem_tree:

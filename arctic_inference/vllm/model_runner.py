@@ -646,7 +646,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         ):
             self.maybe_setup_kv_connector(scheduler_output)
 
-            # # ### Record GPU execution start time for monitoring
+            # # # ### Record GPU execution start time for monitoring
             torch.cuda.synchronize()
             execution_start_time = time.perf_counter()
             execution_start_timestamp = datetime.now().isoformat()
@@ -749,12 +749,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             )
             sampler_output.sampled_token_ids = output_token_ids
 
-        # #### Record GPU execution end time after all GPU computations are complete
+        # # #### Record GPU execution end time after all GPU computations are complete
         torch.cuda.synchronize()
         execution_end_time = time.perf_counter()
         execution_duration = execution_end_time - execution_start_time
+        # Calculate total kv_len across all requests
+        kv_len = sum(self.requests[req_id].num_computed_tokens for req_id in self.input_batch.req_ids)
         self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
-                                scheduler_output.total_num_scheduled_tokens, early_return=False, doc_type="GPU_execution_time")
+                                scheduler_output.total_num_scheduled_tokens, kv_len=kv_len, early_return=False, doc_type="GPU_execution_time")
 
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -867,6 +869,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 aux_hidden_states,
                 spec_decode_metadata,
                 attn_metadata,
+                batch_size,
             )
                        
             # Determine whether to enable confidence-based filtering of spec tokens.
@@ -897,22 +900,25 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     spec_token_ids = filtered_spec_token_ids
                 
 
-            # # # # 统计和控制 spec_token 数量（优先 hard，再分配 medium）
+            # # # # # 统计和控制 spec_token 数量（优先 hard，再分配 medium，最后 easy）
             # if spec_token_ids is not None and distribution_aware:
-            #     hard_indices, medium_indices = self._get_hard_and_non_hard_indices()
+            #     hard_indices, medium_indices, easy_indices, allowed_indices = self._get_hard_and_non_hard_indices()
 
-            #     # 先按 hard 分配，再将剩余分配给 medium，配额总量为 200
+            #     # 先按 hard 分配，再将剩余分配给 medium，最后分配给 easy，配额总量为 600
             #     spec_token_ids = self._apply_quota_to_spec_tokens(
             #         spec_token_ids=spec_token_ids,
             #         hard_indices=hard_indices,
-            #         non_hard_indices=medium_indices,
-            #         quota=1000,
+            #         medium_indices=medium_indices,
+            #         easy_indices=easy_indices,
+            #         quota=300-batch_size,
             #     )
             torch.cuda.synchronize()
             cpu_execution_end_time = time.perf_counter()
             cpu_execution_duration = cpu_execution_end_time - cpu_execution_start_time
+            # Calculate total kv_len across all requests
+            kv_len = sum([(self.requests[req_id]).num_computed_tokens for req_id in self.input_batch.req_ids])
             self._log_execution_time(cpu_execution_start_timestamp, cpu_execution_duration, batch_size, 
-                                    scheduler_output.total_num_scheduled_tokens, early_return=False, doc_type="CPU_execution_time")
+                                    scheduler_output.total_num_scheduled_tokens, kv_len=kv_len, early_return=False, doc_type="CPU_execution_time")
 
         # Clear KVConnector state after all KVs are generated.
         if has_kv_transfer_group():
@@ -1025,7 +1031,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     medium_indices.append(i)
                 elif pid_str in easy_set:
                     easy_indices.append(i)
-            allowed_indices = set(hard_indices) | set(medium_indices) | set(easy_indices)
+            allowed_indices = hard_indices + medium_indices + easy_indices
 
             ProblemIdContextManager.set_hard_medium_indices(hard_indices, medium_indices, easy_indices, allowed_indices)
         
@@ -1035,72 +1041,102 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         self,
         spec_token_ids: list,
         hard_indices: list[int],
-        non_hard_indices: list[int],
+        medium_indices: list[int],
+        easy_indices: list[int],
         quota: int = 200,
     ) -> list:
         """
         在给定配额下调整 `spec_token_ids`：
-        - 优先保留 hard 请求；
-        - 若 hard 请求总 tokens 超额，则按比例削减 hard，并删除所有 non-hard；
-        - 否则，将剩余配额按比例分配给 non-hard。
+        - 按优先级分配配额：hard -> medium -> easy
+        - 若某一级别的 tokens 超过剩余配额，则按比例削减该级别，并删除后续所有级别
+        - 否则，将剩余配额继续分配给下一优先级
         """
-        # 统计 hard 请求的 tokens 数量
-        hard_spec_tokens = 0
-        for i in hard_indices:
-            if i < len(spec_token_ids) and spec_token_ids[i] is not None:
-                hard_spec_tokens += len(spec_token_ids[i])
-
-        if hard_spec_tokens > quota:
-            keep_ratio = quota / max(1, hard_spec_tokens)
-            filtered_spec_token_ids = []
+        # 转换为集合以加快查找速度
+        hard_set = set(hard_indices)
+        medium_set = set(medium_indices)
+        easy_set = set(easy_indices)
+        
+        # 统计每个优先级的 tokens 数量
+        hard_spec_tokens = sum(
+            len(spec_token_ids[i]) 
+            for i in hard_indices 
+            if i < len(spec_token_ids) and spec_token_ids[i] is not None
+        )
+        
+        medium_spec_tokens = sum(
+            len(spec_token_ids[i]) 
+            for i in medium_indices 
+            if i < len(spec_token_ids) and spec_token_ids[i] is not None
+        )
+        
+        easy_spec_tokens = sum(
+            len(spec_token_ids[i]) 
+            for i in easy_indices 
+            if i < len(spec_token_ids) and spec_token_ids[i] is not None
+        )
+        
+        # 初始化过滤后的结果
+        filtered_spec_token_ids = [[] for _ in range(len(spec_token_ids))]
+        remaining_quota = quota
+        
+        # 第一优先级：hard
+        if hard_spec_tokens > remaining_quota:
+            # hard 超额，按比例削减 hard，删除 medium 和 easy
+            keep_ratio = remaining_quota / max(1, hard_spec_tokens)
             for i in range(len(spec_token_ids)):
-                if i in hard_indices:
+                if i in hard_set:
                     if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
                         keep_count = max(1, int(len(spec_token_ids[i]) * keep_ratio))
-                        filtered_tokens = spec_token_ids[i][:keep_count]
-                        filtered_spec_token_ids.append(filtered_tokens)
+                        filtered_spec_token_ids[i] = spec_token_ids[i][:keep_count]
                     else:
-                        filtered_spec_token_ids.append(spec_token_ids[i])
-                else:
-                    filtered_spec_token_ids.append([])
+                        filtered_spec_token_ids[i] = spec_token_ids[i] if spec_token_ids[i] is not None else []
             return filtered_spec_token_ids
-
-        remaining_quota = quota - hard_spec_tokens
-
-        # 统计 non-hard 请求的 tokens 数量
-        non_hard_spec_tokens = 0
-        for i in non_hard_indices:
-            if i < len(spec_token_ids) and spec_token_ids[i] is not None:
-                non_hard_spec_tokens += len(spec_token_ids[i])
-
-        if non_hard_spec_tokens > 0 and remaining_quota > 0:
-            non_hard_ratio = min(1.0, remaining_quota / max(1, non_hard_spec_tokens))
-            filtered_spec_token_ids = []
-            for i in range(len(spec_token_ids)):
-                if i in hard_indices:
-                    filtered_spec_token_ids.append(spec_token_ids[i])
-                else:
-                    if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
-                        keep_count = max(0, int(len(spec_token_ids[i]) * non_hard_ratio))
-                        if keep_count > 0:
-                            filtered_tokens = spec_token_ids[i][:keep_count]
-                            filtered_spec_token_ids.append(filtered_tokens)
+        
+        # hard 未超额，保留所有 hard tokens
+        for i in hard_set:
+            if i < len(spec_token_ids):
+                filtered_spec_token_ids[i] = spec_token_ids[i] if spec_token_ids[i] is not None else []
+        remaining_quota -= hard_spec_tokens
+        
+        # 第二优先级：medium
+        if medium_spec_tokens > remaining_quota:
+            # medium 超额，按比例削减 medium，删除 easy
+            if medium_spec_tokens > 0:
+                keep_ratio = remaining_quota / max(1, medium_spec_tokens)
+                for i in medium_set:
+                    if i < len(spec_token_ids):
+                        if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
+                            keep_count = max(1, int(len(spec_token_ids[i]) * keep_ratio))
+                            filtered_spec_token_ids[i] = spec_token_ids[i][:keep_count]
                         else:
-                            filtered_spec_token_ids.append([])
-                    else:
-                        filtered_spec_token_ids.append(spec_token_ids[i])
+                            filtered_spec_token_ids[i] = spec_token_ids[i] if spec_token_ids[i] is not None else []
             return filtered_spec_token_ids
-
-        if remaining_quota <= 0:
-            filtered_spec_token_ids = []
-            for i in range(len(spec_token_ids)):
-                if i in hard_indices:
-                    filtered_spec_token_ids.append(spec_token_ids[i])
-                else:
-                    filtered_spec_token_ids.append([])
+        
+        # medium 未超额，保留所有 medium tokens
+        for i in medium_set:
+            if i < len(spec_token_ids):
+                filtered_spec_token_ids[i] = spec_token_ids[i] if spec_token_ids[i] is not None else []
+        remaining_quota -= medium_spec_tokens
+        
+        # 第三优先级：easy
+        if easy_spec_tokens > remaining_quota:
+            # easy 超额，按比例削减 easy
+            if easy_spec_tokens > 0:
+                keep_ratio = remaining_quota / max(1, easy_spec_tokens)
+                for i in easy_set:
+                    if i < len(spec_token_ids):
+                        if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
+                            keep_count = max(0, int(len(spec_token_ids[i]) * keep_ratio))
+                            if keep_count > 0:
+                                filtered_spec_token_ids[i] = spec_token_ids[i][:keep_count]
             return filtered_spec_token_ids
-
-        return spec_token_ids
+        
+        # easy 未超额，保留所有 easy tokens
+        for i in easy_set:
+            if i < len(spec_token_ids):
+                filtered_spec_token_ids[i] = spec_token_ids[i] if spec_token_ids[i] is not None else []
+        
+        return filtered_spec_token_ids
 
     def get_current_batch_problem_ids(self) -> list[Optional[str]]:
         """
@@ -1140,6 +1176,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         aux_hidden_states: Optional[torch.Tensor],
         spec_decode_metadata: Optional[SpecDecodeMetadata],
         attn_metadata: dict[str, Any],
+        batchsize: int = 1,
     ) -> list[list[int]]:
         #print('\n batchsize: ', len(self.input_batch.req_ids))
         disable_spec_decode = (
@@ -1155,7 +1192,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         new_sampled_token_ids = sampled_token_ids.copy()
         if self._suffix_cache is not None:
             results = self.propose_suffix_draft_token_ids(
-                new_sampled_token_ids)
+                sampled_token_ids = new_sampled_token_ids, batch_size = batchsize)
             suffix_spec_token_ids = []
             # The score is an estimate of the acceptance length. Thus, the
             # heuristic is to use the suffix decoded tokens if the score is
@@ -1301,11 +1338,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         
         for task_data in task_batch:
             # 解包任务数据
-            (i, req_id, problem_id, pattern, spec_ids, config, end_idx, max_model_len, spec_len) = task_data
+            (i, req_id, problem_id, pattern, spec_ids, config, end_idx, max_model_len, spec_len, min_token_prob, spec_factor) = task_data
             
             # 准备pattern
-            if len(pattern) > config.suffix_cache_max_depth:
-                pattern = pattern[-config.suffix_cache_max_depth:]
+            if len(pattern) > 16:
+                pattern = pattern[-16:]
             
             pattern = pattern + spec_ids
             if len(pattern) > config.suffix_cache_max_depth:
@@ -1320,7 +1357,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 spec_len
             )
             
-            max_spec_factor = config.suffix_max_spec_factor
+            max_spec_factor = spec_factor
             max_spec_offset = config.suffix_max_spec_offset - len(spec_ids) * (max_spec_factor + 1)
             
             # 🎯 使用预取的problem_tree对象
@@ -1331,56 +1368,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             max_spec_tokens=max_spec_tokens,
             max_spec_factor=max_spec_factor,
             max_spec_offset=max_spec_offset,
-            min_token_prob=config.suffix_min_token_prob)
+            min_token_prob=min_token_prob)
             
             batch_results.append((task_data, result))
         
         return batch_results
-    
-    def _process_single_speculation_v2(self, task_data):
-        """Process a single speculation request with pre-extracted data (NO shared state access)"""
-        import threading
-        thread_id = threading.current_thread().ident
-        start_time = time.perf_counter()
-        
-        (i, req_id, problem_id, pattern, spec_ids, config, end_idx, max_model_len) = task_data
-        
-        # All data is already extracted, no need to access self.input_batch!
-        if len(pattern) > config.suffix_cache_max_depth:
-            pattern = pattern[-config.suffix_cache_max_depth:]
-        
-        # Add spec_ids to pattern
-        pattern = pattern + spec_ids
-        if len(pattern) > config.suffix_cache_max_depth:
-            pattern = pattern[-config.suffix_cache_max_depth:]
-        
-        max_spec_tokens = min(
-            config.num_speculative_tokens if config.num_speculative_tokens is not None else config.suffix_cache_max_depth,
-            MAX_SPEC_LEN - len(spec_ids),
-            config.suffix_cache_max_depth,
-            max_model_len - end_idx - 1
-        )
-        max_spec_tokens = 5
-        
-        max_spec_factor = config.suffix_max_spec_factor
-        max_spec_offset = config.suffix_max_spec_offset - len(spec_ids) * (max_spec_factor + 1)
-        
-        #spec_start = time.perf_counter()
-        result = self._suffix_cache.speculate(
-            req_id,
-            problem_id,
-            pattern,
-            max_spec_tokens=max_spec_tokens,
-            max_spec_factor=max_spec_factor,
-            max_spec_offset=max_spec_offset,
-            min_token_prob=config.suffix_min_token_prob)
-        # spec_time = (time.perf_counter() - spec_start) * 1000
-        # total_time = (time.perf_counter() - start_time) * 1000
-        
-        # if total_time > 100:
-        #     print(f"[Task] thread={thread_id}, req_id={req_id}, spec={spec_time:.0f}ms, total={total_time:.0f}ms")
-        
-        return result
     
     def _process_single_speculation(self, args):
         """Process a single speculation request for parallel execution (OLD VERSION with shared state)"""
@@ -1416,7 +1408,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                               MAX_SPEC_LEN - len(spec_ids),
                               config.suffix_cache_max_depth,
                               self.max_model_len - end_idx - 1)
-        max_spec_tokens = 5
         # max_spec_offset is modified to mimic the behavior of the original
         # max_spec_factor and max_spec_offset as if the speculative tokens
         # were generated by suffix decoding. For example, if:
@@ -1509,6 +1500,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         self,
         sampled_token_ids: list[list[int]],
         spec_token_ids: Optional[list[list[int]]] = None,
+        batch_size: int = 1,
     ) -> list[list[int]]:
         config = self.speculative_config
         
@@ -1543,8 +1535,18 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # batch_start = time.perf_counter()
             # extract_start = time.perf_counter()
             prepared_tasks = []
-            hard_spec, medium_spec, easy_spec = 16, 8, 3
-            for i in hard_indices:
+            hard_spec, hard_prob, hard_spec_factor = 16, 0.1, 2
+            medium_spec, medium_prob, medium_spec_factor = 8, 0.1, 1
+            easy_spec, easy_prob, easy_spec_factor = 4, 0.1, 1
+            if batch_size <= 64:
+                medium_spec, medium_prob,  medium_spec_factor = 16, 0.1, 2
+                easy_spec, easy_prob,easy_spec_factor = 16, 0.1, 2
+            elif batch_size <= 128:
+                medium_spec, medium_prob, medium_spec_factor = 16, 0.1, 2
+                easy_spec, easy_prob, easy_spec_factor = 8, 0.1, 1
+            if spec_token_ids is not None:
+                print(f"spec_token_ids length: {spec_token_ids}")
+            for i in hard_indices: # mean 15k, max 16k
                 if 0 <= i < len(sampled_token_ids):
                     sampled_ids = sampled_token_ids[i]
                     spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
@@ -1559,10 +1561,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     # Pack everything into a self-contained tuple
                     prepared_tasks.append((
                         i, req_id, problem_id, pattern, spec_ids, 
-                        config, end_idx, self.max_model_len, hard_spec
+                        config, end_idx, self.max_model_len, hard_spec,hard_prob,hard_spec_factor
                     ))
 
-            for i in medium_indices:
+            for i in medium_indices: # mean 8k, max 16k
                 if 0 <= i < len(sampled_token_ids):
                     sampled_ids = sampled_token_ids[i]
                     spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
@@ -1575,9 +1577,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     problem_id = self.get_problem_id_by_request_id(req_id)
                     prepared_tasks.append((
                         i, req_id, problem_id, pattern, spec_ids, 
-                        config, end_idx, self.max_model_len, medium_spec
+                        config, end_idx, self.max_model_len, medium_spec,medium_prob,medium_spec_factor
                     ))
-            for i in easy_indices:
+            for i in easy_indices: # mean 4k, max 16k
                 if 0 <= i < len(sampled_token_ids):
                     sampled_ids = sampled_token_ids[i]
                     spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
@@ -1590,7 +1592,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     problem_id = self.get_problem_id_by_request_id(req_id)
                     prepared_tasks.append((
                         i, req_id, problem_id, pattern, spec_ids, 
-                        config, end_idx, self.max_model_len, easy_spec
+                        config, end_idx, self.max_model_len, easy_spec,easy_prob,easy_spec_factor
                     ))
 
             if not prepared_tasks:
@@ -1657,7 +1659,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 try:
                     results[index] = future.result()
                 except Exception as e:
-                    print(f"Error processing speculation for index {index}: {e}")
+                    #print(f"Error processing speculation for index {index}: {e}")
                     results[index] = SuffixSpecResult()  # Fallback to empty result
 
             return results
@@ -1798,7 +1800,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             for mod in self.shift_model.modules():
                 if isinstance(mod, Attention):
                     mod.kv_cache = forward_context[mod.layer_name].kv_cache
-    def _log_execution_time(self, start_timestamp, duration_seconds, batch_size, num_scheduled_tokens,early_return=False, doc_type: str = "GPU_execution_time"):
+    def _log_execution_time(self, start_timestamp, duration_seconds, batch_size, num_scheduled_tokens, kv_len=None, early_return=False, doc_type: str = "GPU_execution_time"):
         """Log execution time metrics for execute_model calls"""
         try:
             timing_data = {
@@ -1808,6 +1810,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 "execution_duration_ms": duration_seconds * 1000,
                 "batch_size": batch_size,
                 "num_scheduled_tokens": num_scheduled_tokens,
+                "kv_len": kv_len,
                 "process_info": {
                     "rank": int(os.getenv("RANK", "0")),
                     "local_rank": int(os.getenv("LOCAL_RANK", "0")),

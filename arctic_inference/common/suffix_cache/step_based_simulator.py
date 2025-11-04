@@ -388,6 +388,7 @@ def tokenize_text_data(df: pd.DataFrame, tokenizer_name: str) -> pd.DataFrame:
 
 def run_step_based_simulation(
     data_file: str,
+    eval_data_file: str,
     tokenizer_name: str,
     max_depth: int = 64,
     max_spec_tokens: int = 0,
@@ -407,8 +408,9 @@ def run_step_based_simulation(
 ) -> pd.DataFrame:
     df = load_jsonl_data(data_file)
     df = tokenize_text_data(df, tokenizer_name)
-
+    eval_df = load_jsonl_data(eval_data_file)
     step_groups = group_data_by_step(df)
+    eval_groups = group_data_by_step(eval_df)
     all_steps = sorted(step_groups.keys())
     all_results: List[Dict] = []
     start_step = start_step or all_steps[0]
@@ -419,7 +421,7 @@ def run_step_based_simulation(
             continue
         if current_step > end_step:
             break
-        eval_data = step_groups[current_step].reset_index(drop=True)
+        eval_data = eval_groups[current_step].reset_index(drop=True)
 
         train_data_frames = []
         if check_model_change:
@@ -548,6 +550,11 @@ def main():
         help="Path to the JSONL data file",
     )
     parser.add_argument(
+        "--eval_file",
+        type=str,
+        help="Path to the JSONL data file",
+    )
+    parser.add_argument(
         "--tokenizer",
         type=str,
         required=True,
@@ -556,7 +563,7 @@ def main():
     parser.add_argument(
         "--max-depth",
         type=int,
-        default=64,
+        default=16,
         help="Max depth of the suffix tree",
     )
     parser.add_argument(
@@ -638,6 +645,7 @@ def main():
 
     results_df = run_step_based_simulation(
         data_file=args.data_file,
+        eval_data_file=args.eval_file
         tokenizer_name=args.tokenizer,
         max_depth=args.max_depth,
         max_spec_tokens=args.max_spec_tokens,
