@@ -63,6 +63,8 @@ class ArcticSpeculativeConfig(SpeculativeConfig):
     suffix_max_spec_factor: float = 1.0
     suffix_max_spec_offset: float = 0.0
     suffix_min_token_prob: float = 0.1
+    confidence_based_only: bool = False
+    distribution_aware: bool = False
 
 
 class ParallelConfigPatch(ArcticPatch[ParallelConfig]):

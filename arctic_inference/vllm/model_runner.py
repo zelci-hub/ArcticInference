@@ -176,6 +176,7 @@ class ProblemIdContextManager:
     def get_hard_medium_indices() -> tuple[List[int], List[int], List[int], List[int]]:
         """Get cached hard, medium, and easy indices."""
         if not hasattr(_problem_id_context, 'data'):
+            print("DEBUG in ProblemIdContextManager: no data")
             return [], [], [], []
         return (_problem_id_context.data.get('hard_indices', []),
                 _problem_id_context.data.get('medium_indices', []),
@@ -289,9 +290,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         self._orig_init(vllm_config, device)
 
-        # Initialize problem_id tracking
-        self._current_batch_req_id_to_problem_id = {}
-
         # Set up speculative decoding.
         self._suffix_cache = None
         if arctic_speculative_config is not None:
@@ -363,33 +361,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         Returns:
             The problem_id if found, None otherwise
         """
-        # Method 1: Use current batch mapping (most efficient and reliable)
-        if hasattr(self, '_current_batch_req_id_to_problem_id'):
-            problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
-            if problem_id is not None:
-                return problem_id
-        
-        # Method 2: Try context manager
         try:
             problem_id = ProblemIdContextManager.get_problem_id_for_req_id(req_id)
             if problem_id is not None:
                 return problem_id
         except Exception:
-            pass
-        
-        # Method 3: Try to extract from input_batch if available
-        try:
-            if hasattr(self, 'input_batch') and hasattr(self.input_batch, 'req_ids'):
-                req_ids = self.input_batch.req_ids
-                if req_id in req_ids:
-                    index = req_ids.index(req_id)
-                    problem_id = self._get_problem_id_for_index(index)
-                    if problem_id is not None:
-                        return problem_id
-        except Exception:
-            pass
-        
-        print(f"Failed to get problem_id for request {req_id}")
+            print(f"DEBUG in GPUModelRunnerPatch: Failed to get problem_id for request {req_id}")
         return None
 
     def _get_problem_id_for_index(self, index: int) -> Optional[str]:
@@ -452,17 +429,15 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             hard_set = set(str(pid) for pid in (hard_ids or []))
             medium_set = set(str(pid) for pid in (medium_ids or []))
             easy_set = set(str(pid) for pid in (easy_ids or []))
-            
-            if hasattr(self, 'input_batch') and hasattr(self.input_batch, 'req_ids'):
-                for i, req_id in enumerate(self.input_batch.req_ids):
-                    problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
-                    pid_str = str(problem_id)
-                    if pid_str in hard_set:
-                        hard_indices.append(i)
-                    elif pid_str in medium_set:
-                        medium_indices.append(i)
-                    elif pid_str in easy_set:
-                        easy_indices.append(i)
+            for i, req_id in enumerate(self.input_batch.req_ids):
+                problem_id = ProblemIdContextManager.get_problem_id_for_req_id(req_id)
+                pid_str = str(problem_id)
+                if pid_str in hard_set:
+                    hard_indices.append(i)
+                elif pid_str in medium_set:
+                    medium_indices.append(i)
+                elif pid_str in easy_set:
+                    easy_indices.append(i)
             
             allowed_indices = hard_indices + medium_indices + easy_indices
             ProblemIdContextManager.set_hard_medium_indices(hard_indices, medium_indices, easy_indices, allowed_indices)
@@ -580,6 +555,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
         self._update_states(scheduler_output)
+
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
                 # Return empty ModelRunnerOutput if there's no work to do.
@@ -1035,19 +1011,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 continue
 
             index = self.input_batch.req_id_to_index[req_id]
+            problem_id = self.get_problem_id_by_request_id(req_id)
             if req_id not in self._suffix_cache.active_requests:
-                if req_id in self._suffix_cache.cached_requests:
-                    # Reset the suffix cache for this request.
-                    self._suffix_cache.evict_cached_response(req_id)
                 num_prompt_tokens = self.input_batch.num_prompt_tokens[index]
                 prompt_token_ids = (
                     self.input_batch.token_ids_cpu[index, :num_prompt_tokens])
-                self._suffix_cache.start_request(req_id, prompt_token_ids)
+                self._suffix_cache.start_request(req_id,problem_id,prompt_token_ids)
 
-            # Get problem_id for this request
-            problem_id = self.get_problem_id_by_request_id(req_id)
-            
-            self._suffix_cache.add_active_response(req_id, sampled_ids, problem_id)
+            self._suffix_cache.add_active_response(req_id, problem_id, sampled_ids)
 
         # Stop requests that are not seen
         for req_id in list(self._suffix_cache.active_requests):
@@ -1066,9 +1037,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         batch_size = len(sampled_token_ids)
         
         # Timing: Get hard/medium/easy indices
-        # indices_start_time = _time.perf_counter()
         hard_indices, medium_indices, easy_indices, allowed_indices = self._get_hard_and_non_hard_indices()
-        # indices_time = _time.perf_counter() - indices_start_time
+        #print(f"hard_indices: {len(hard_indices)}, medium_indices: {len(medium_indices)}, easy_indices: {len(easy_indices)}, allowed_indices: {len(allowed_indices) }")
         
         # Define spec parameters based on problem difficulty and batch size
         hard_spec, hard_prob, hard_spec_factor = 16, 0.1, 2
@@ -1083,58 +1053,18 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             medium_spec, medium_prob, medium_spec_factor = 16, 0.1, 2
             easy_spec, easy_prob, easy_spec_factor = 8, 0.1, 1
         
-        # # Log differentiated processing info if we have categorized requests
-        # if hard_indices or medium_indices or easy_indices:
-        #     from vllm.logger import init_logger
-        #     logger = init_logger(__name__)
-        #     logger.debug(f"Differentiated speculation - Batch size: {batch_size}, "
-        #                 f"Hard: {len(hard_indices)} (spec={hard_spec}), "
-        #                 f"Medium: {len(medium_indices)} (spec={medium_spec}), "
-        #                 f"Easy: {len(easy_indices)} (spec={easy_spec})")
-        
-        # # Timing: Start processing loop
-        # processing_start_time = _time.perf_counter()
-        # speculation_times = []
         results = []
-        for i, sampled_ids in enumerate(sampled_token_ids):
-            # Timing: Start individual request processing
-            request_start_time = _time.perf_counter()
-            
+        for i, sampled_ids in enumerate(sampled_token_ids):   
             spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
             num_sampled_ids = len(sampled_ids)
             if not num_sampled_ids:
                 # Skip speculative decoding.
                 results.append(SuffixDecodingDraft())
-                # speculation_times.append({
-                #     "request_index": i,
-                #     "processing_time_ms": (_time.perf_counter() - request_start_time) * 1000,
-                #     "skipped": True,
-                #     "reason": "no_sampled_ids"
-                # })
                 continue
 
             req_id = self.input_batch.req_ids[i]
 
-            # Add sampled_token_ids to token_ids_cpu.
-            start_idx = self.input_batch.num_tokens_no_spec[i]
-            end_idx = start_idx + len(sampled_ids)
-
-            if end_idx >= self.max_model_len:
-                results.append(SuffixDecodingDraft())
-                self.input_batch.token_ids_cpu[
-                    i, start_idx:self.
-                    max_model_len] = sampled_ids[:self.max_model_len -
-                                                 start_idx]
-                # speculation_times.append({
-                #     "request_index": i,
-                #     "processing_time_ms": (_time.perf_counter() - request_start_time) * 1000,
-                #     "skipped": True,
-                #     "reason": "max_model_len_exceeded"
-                # })
-                continue
-
-            self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
-
+            end_idx = self.input_batch.num_tokens_no_spec[i]
             size = min(end_idx, config.suffix_cache_max_depth)
             pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx]
             pattern = pattern.tolist() + spec_ids
@@ -1157,6 +1087,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 current_spec_tokens = easy_spec
                 current_min_prob = easy_prob
                 current_spec_factor = easy_spec_factor
+            else:
+                results.append(SuffixDecodingDraft())
+                continue
+
             
             max_spec_tokens = min(
                 MAX_SPEC_LEN - len(spec_ids),
@@ -1184,18 +1118,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             req_id = self.input_batch.req_ids[i]
             problem_id = self.get_problem_id_by_request_id(req_id)
             
-            # # Determine difficulty category for this request
-            # difficulty_category = "default"
-            # if i in hard_indices:
-            #     difficulty_category = "hard"
-            # elif i in medium_indices:
-            #     difficulty_category = "medium"
-            # elif i in easy_indices:
-            #     difficulty_category = "easy"
-            
-            # Timing: Start speculation
-            # speculation_start_time = _time.perf_counter()
-            
+    
             result, source = self._suffix_cache.speculate(
                 req_id,
                 pattern,
@@ -1205,79 +1128,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 min_token_prob=current_min_prob,
                 problem_id=problem_id,
             )
-            
-            # speculation_time = _time.perf_counter() - speculation_start_time
-            # request_total_time = _time.perf_counter() - request_start_time
-
-            # # Record timing data for this request
-            # speculation_times.append({
-            #     "request_index": i,
-            #     "req_id": req_id,
-            #     "problem_id": problem_id,
-            #     "difficulty_category": difficulty_category,
-            #     "speculation_time_ms": speculation_time * 1000,
-            #     "total_request_time_ms": request_total_time * 1000,
-            #     "spec_params": {
-            #         "max_spec_tokens": max_spec_tokens,
-            #         "max_spec_factor": max_spec_factor,
-            #         "min_token_prob": current_min_prob
-            #     },
-            #     "result_score": result.score if hasattr(result, 'score') else 0,
-            #     "result_tokens": len(result.token_ids) if hasattr(result, 'token_ids') else 0,
-            #     "source": source,
-            #     "pattern_length": len(pattern),
-            #     "skipped": False
-            # })
 
             results.append(result)
-
-        # Calculate total processing time
-        # processing_time = _time.perf_counter() - processing_start_time
-        # method_total_time = _time.perf_counter() - method_start_time
-
-        # Aggregate timing statistics
-        # total_speculation_time = sum(t.get("speculation_time_ms", 0) for t in speculation_times if not t.get("skipped", False))
-        # avg_speculation_time = total_speculation_time / max(1, len([t for t in speculation_times if not t.get("skipped", False)]))
-        
-        # # # Count by difficulty
-        # hard_count = len([t for t in speculation_times if t.get("difficulty_category") == "hard"])
-        # medium_count = len([t for t in speculation_times if t.get("difficulty_category") == "medium"])
-        # easy_count = len([t for t in speculation_times if t.get("difficulty_category") == "easy"])
-        # default_count = len([t for t in speculation_times if t.get("difficulty_category") == "default"])
-        # skipped_count = len([t for t in speculation_times if t.get("skipped", False)])
-
-        # Log comprehensive timing data
-        # timing_data = {
-        #     "timestamp": method_start_time,
-        #     "call_type": "propose_suffix_draft_token_ids",
-        #     "batch_size": batch_size,
-        #     "method_total_time_ms": method_total_time * 1000,
-        #     "indices_calculation_time_ms": indices_time * 1000,
-        #     "processing_time_ms": processing_time * 1000,
-        #     "total_speculation_time_ms": total_speculation_time,
-        #     "avg_speculation_time_ms": avg_speculation_time,
-        #     "difficulty_distribution": {
-        #         "hard": hard_count,
-        #         "medium": medium_count,
-        #         "easy": easy_count,
-        #         "default": default_count,
-        #         "skipped": skipped_count
-        #     },
-        #     "spec_parameters": {
-        #         "hard": {"spec": hard_spec, "prob": hard_prob, "factor": hard_spec_factor},
-        #         "medium": {"spec": medium_spec, "prob": medium_prob, "factor": medium_spec_factor},
-        #         "easy": {"spec": easy_spec, "prob": easy_prob, "factor": easy_spec_factor}
-        #     },
-        #     "individual_requests": speculation_times,
-        #     "process_info": {
-        #         "rank": int(_os.getenv("RANK", "0")),
-        #         "local_rank": int(_os.getenv("LOCAL_RANK", "0"))
-        #     }
-        # }
-        
-        # Log the timing data
-        # self._log_suffix_speculation_timing(timing_data)
-
         return results
 
     def load_model(self) -> None:
