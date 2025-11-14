@@ -28,6 +28,7 @@ from arctic_inference.vllm.config import (ParallelConfigPatch,
                                           MLPSpeculatorConfigPatch)
 from arctic_inference.vllm.stats import (SpecDecodingStatsPatch, 
                                          SpecDecodingLoggingPatch)
+from arctic_inference.vllm.structured_output import XgrammarBackendPatch
 from arctic_inference.vllm.ulysses import apply_shift_parallel_patches
 
 
@@ -64,14 +65,14 @@ class WorkerBasePatch(ArcticPatch[WorkerBase]):
 
 
 def arctic_inference_plugin():
-
-    if (vllm.__version__ != get_compatible_vllm_version() and not
-            vllm.__version__.startswith("0.1.dev")):  # Make it work with dev
-        logger.warning(
-            f"ArcticInference requires vllm=={get_compatible_vllm_version()} "
-            f"but found vllm=={vllm.__version__}. Ignoring plugin!")
-        return
-
+    if not int(os.getenv("ARCTIC_INFERENCE_SKIP_VERSION_CHECK", "0")):
+        compatible_version = get_compatible_vllm_version()
+        if vllm.__version__ != compatible_version:
+            logger.warning(
+                f"ArcticInference requires vllm=={compatible_version} "
+                f"but found vllm=={vllm.__version__}. Ignoring plugin!")
+            return
+    
     if not vllm.platforms.current_platform.is_cuda():
         logger.warning(
             f"ArcticInference requires the cuda platform. Ignoring plugin!")
@@ -91,12 +92,13 @@ def arctic_inference_plugin():
     AutoConfig.register("llama_swiftkv", LlamaSwiftKVConfig)
 
     from vllm import ModelRegistry
-    from arctic_inference.vllm.swiftkv import LlamaSwiftKVForCausalLM
+    #from arctic_inference.vllm.swiftkv import LlamaSwiftKVForCausalLM
 
     # Register SwiftKV model definitions to vLLM.
-    ModelRegistry.register_model("LlamaSwiftKVForCausalLM",
-                                 LlamaSwiftKVForCausalLM)
-    
+    ModelRegistry.register_model(
+        "LlamaSwiftKVForCausalLM",
+        "arctic_inference.vllm.swiftkv:LlamaSwiftKVForCausalLM")
+
     # Register ArcticSpeculator models to vLLM.
     from arctic_inference.vllm.spec_dec.arctic_speculator import (
         ArcticMLPSpeculator, ArcticLSTMSpeculator)
@@ -120,7 +122,12 @@ def arctic_inference_plugin():
     SpecDecodingStatsPatch.apply_patch()
     SpecDecodingLoggingPatch.apply_patch()
     VllmConfigPatch.apply_patch()
+    XgrammarBackendPatch.apply_patch()
     MLPSpeculatorConfigPatch.apply_patch()
+
+    # Apply LLM patches for problem_id support (early application)
+    from arctic_inference.vllm.llm import apply_llm_patches
+    apply_llm_patches()
 
     # Main optimization patches.
     apply_shift_parallel_patches()

@@ -16,35 +16,47 @@
 import contextlib
 import copy
 import time
-from typing import Union, Optional, TYPE_CHECKING
+import threading
+import re
+from typing import Any, Union, Optional, TYPE_CHECKING, Hashable, List
+from itertools import tee
+import json
+import os as _os
+import atexit as _atexit
+import time as _time
+from datetime import datetime
 
+import numpy as np
 import torch
 import vllm.distributed.parallel_state as parallel_state
+import vllm.envs as envs
+from tqdm import tqdm
 from vllm.attention.layer import Attention
+from vllm.compilation.counter import compilation_counter
 from vllm.config import CompilationLevel
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import (get_pp_group, get_tp_group,
+                                             is_global_first_rank)
 from vllm.forward_context import set_forward_context
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader import get_model
 from vllm.sequence import IntermediateTensors
-from vllm.utils import async_tensor_h2d
+from vllm.utils import round_up
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import MAX_SPEC_LEN, RejectionSampler
-from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.medusa import MedusaProposer
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
-from arctic_inference.common.suffix_cache import SuffixCache
+from arctic_inference.suffix_decoding import (SuffixDecodingCache,
+                                              SuffixDecodingDraft)
 from arctic_inference.patching import ArcticPatch
 from arctic_inference.vllm.spec_dec.arctic_proposer import ArcticProposer
-from arctic_inference.common.suffix_cache import SuffixSpecResult
 
 SP_TP_MODE = None
 
@@ -65,8 +77,8 @@ def set_shift_parallel_mode(mode: Optional[bool]):
     old_tp_group = parallel_state.get_tp_group()
     SP_TP_MODE = mode
 
-    parallel_state._TP = (parallel_state._SP_TP if mode
-                          else parallel_state._ORIG_TP)
+    parallel_state._TP = (parallel_state._SP_TP
+                          if mode else parallel_state._ORIG_TP)
 
     try:
         yield
@@ -82,12 +94,167 @@ def is_shift_parallel_mode() -> bool:
     return SP_TP_MODE is True
 
 
+# Thread-local storage for problem_ids context
+_problem_id_context = threading.local()
+
+
+class ProblemIdContextManager:
+    """Context manager for problem_ids with req_id mapping support."""
+    
+    @staticmethod
+    def set_current_batch_problem_ids(problem_ids: list[Optional[str]]):
+        """Set problem_ids for the current batch."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        _problem_id_context.data['problem_ids'] = problem_ids
+    
+    @staticmethod
+    def get_current_batch_problem_ids() -> list[Optional[str]]:
+        """Get problem_ids for the current batch."""
+        if not hasattr(_problem_id_context, 'data') or 'problem_ids' not in _problem_id_context.data:
+            return []
+        return _problem_id_context.data.get('problem_ids', [])
+    
+    @staticmethod
+    def set_req_id_to_problem_id_mapping(mapping: dict[str, Optional[str]]):
+        """Set req_id to problem_id mapping."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        _problem_id_context.data['req_id_to_problem_id'] = mapping
+    
+    @staticmethod
+    def get_req_id_to_problem_id_mapping() -> dict[str, Optional[str]]:
+        """Get the req_id to problem_id mapping."""
+        if not hasattr(_problem_id_context, 'data') or 'req_id_to_problem_id' not in _problem_id_context.data:
+            return {}
+        return _problem_id_context.data.get('req_id_to_problem_id', {})
+    
+    @staticmethod
+    def get_problem_id_for_req_id(req_id: str) -> Optional[str]:
+        """Get problem_id for a specific req_id."""
+        mapping = ProblemIdContextManager.get_req_id_to_problem_id_mapping()
+        return mapping.get(req_id)
+    
+    @staticmethod
+    def clear_context():
+        """Clear the current context."""
+        if hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data.clear()
+    
+    @staticmethod
+    def set_hard_medium_ids(hard_ids: Optional[List[str]] = None, 
+                           medium_ids: Optional[List[str]] = None,
+                           easy_ids: Optional[List[str]] = None):
+        """Set hard, medium, and easy problem IDs for distribution-aware processing."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        _problem_id_context.data['hard_ids'] = hard_ids or []
+        _problem_id_context.data['medium_ids'] = medium_ids or []
+        _problem_id_context.data['easy_ids'] = easy_ids or []
+    
+    @staticmethod
+    def get_hard_medium_ids() -> tuple[Optional[List[str]], Optional[List[str]], Optional[List[str]]]:
+        """Get hard, medium, and easy problem IDs."""
+        if not hasattr(_problem_id_context, 'data'):
+            return None, None, None
+        return (_problem_id_context.data.get('hard_ids'),
+                _problem_id_context.data.get('medium_ids'),
+                _problem_id_context.data.get('easy_ids'))
+    
+    @staticmethod
+    def set_hard_medium_indices(hard_indices: List[int], medium_indices: List[int], 
+                               easy_indices: List[int], allowed_indices: List[int]):
+        """Cache hard, medium, and easy indices for the current batch."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        _problem_id_context.data['hard_indices'] = hard_indices
+        _problem_id_context.data['medium_indices'] = medium_indices
+        _problem_id_context.data['easy_indices'] = easy_indices
+        _problem_id_context.data['allowed_indices'] = allowed_indices
+    
+    @staticmethod
+    def get_hard_medium_indices() -> tuple[List[int], List[int], List[int], List[int]]:
+        """Get cached hard, medium, and easy indices."""
+        if not hasattr(_problem_id_context, 'data'):
+            return [], [], [], []
+        return (_problem_id_context.data.get('hard_indices', []),
+                _problem_id_context.data.get('medium_indices', []),
+                _problem_id_context.data.get('easy_indices', []),
+                _problem_id_context.data.get('allowed_indices', []))
+    
+    @staticmethod
+    def has_hard_medium_indices() -> bool:
+        """Check if hard/medium indices are cached."""
+        if not hasattr(_problem_id_context, 'data'):
+            return False
+        return 'hard_indices' in _problem_id_context.data
+
+
+@contextlib.contextmanager
+def batch_context(problem_ids: list[Optional[str]]):
+    """Context manager for batch processing with problem_ids."""
+    try:
+        ProblemIdContextManager.set_current_batch_problem_ids(problem_ids)
+        yield
+    finally:
+        ProblemIdContextManager.clear_context()
+
+
+def extract_problem_id_from_prompt(prompt) -> Optional[str]:
+    """Extract problem_id from a prompt object.
+    
+    This function should be customized based on how problem_id is embedded in prompts.
+    Current implementation supports vLLMRollout's prompt format.
+    """
+    try:
+        # Method 1: Direct problem_id field in dict (vLLMRollout format)
+        if isinstance(prompt, dict) and 'problem_id' in prompt:
+            return prompt['problem_id']
+        
+        # Method 2: If prompt is a dict with prompt_token_ids and problem_id fields
+        if isinstance(prompt, dict):
+            # Check for vLLM input format: {"prompt_token_ids": [...], "problem_id": "..."}
+            if 'problem_id' in prompt:
+                return prompt['problem_id']
+            
+            # Check for meta field containing problem_id
+            if 'meta' in prompt:
+                meta = prompt['meta']
+                if isinstance(meta, dict) and 'problem_id' in meta:
+                    return meta['problem_id']
+        
+        # Method 3: If prompt string contains problem_id pattern
+        if isinstance(prompt, str):
+            # Pattern: problem_id:value
+            match = re.search(r'problem_id:(\w+)', prompt)
+            if match:
+                return match.group(1)
+            
+            # Pattern: [PROBLEM_ID: value]
+            match = re.search(r'\[PROBLEM_ID:\s*(\w+)\]', prompt)
+            if match:
+                return match.group(1)
+        
+        # Method 4: Handle TextPrompt or other prompt types
+        if hasattr(prompt, 'problem_id'):
+            return prompt.problem_id
+        
+        # Method 5: Handle nested structures
+        if hasattr(prompt, 'get'):
+            return prompt.get('problem_id')
+            
+        return None
+    except Exception:
+        return None
+
+
 class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
     _orig_initialize_kv_cache = GPUModelRunner.initialize_kv_cache
     _orig_prepare_inputs = GPUModelRunner._prepare_inputs
     _orig_profile_run = GPUModelRunner.profile_run
     _orig_load_model = GPUModelRunner.load_model
+    _orig_propose_draft_token_ids = GPUModelRunner.propose_draft_token_ids
     _orig_init = GPUModelRunner.__init__
 
     def __init__(
@@ -122,17 +289,19 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         self._orig_init(vllm_config, device)
 
+        # Initialize problem_id tracking
+        self._current_batch_req_id_to_problem_id = {}
+
         # Set up speculative decoding.
         self._suffix_cache = None
         if arctic_speculative_config is not None:
             # Restore the speculative config.
             self.vllm_config.speculative_config = arctic_speculative_config
             self.speculative_config = arctic_speculative_config
-            self.use_spec_decode = True
 
             if get_pp_group().is_last_rank:
-                if (self.speculative_config.method == "arctic" or
-                      self.speculative_config.method == "mlp_speculator"):
+                if (self.speculative_config.method == "arctic"
+                        or self.speculative_config.method == "mlp_speculator"):
                     self.drafter = ArcticProposer(self.vllm_config)
                 elif self.speculative_config.method != "suffix":
                     raise ValueError("Unknown speculative decoding method: "
@@ -140,15 +309,209 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
                 self.rejection_sampler = RejectionSampler()
 
-        if (self.speculative_config is not None and
-                self.speculative_config.enable_suffix_decoding):
-            if self.speculative_config.method not in (
-                    "arctic", "suffix", "mlp_speculator"):
+        if (self.speculative_config is not None
+                and self.speculative_config.enable_suffix_decoding):
+            if self.speculative_config.method not in ("arctic", "suffix",
+                                                      "mlp_speculator"):
                 raise ValueError(
                     "Suffix decoding is only supported with the 'arctic', "
                     "'mlp_speculator' or 'suffix' spec decoding methods.")
-            self._suffix_cache = SuffixCache(
-                self.speculative_config.suffix_cache_max_depth)
+            spec_cfg = self.speculative_config
+            self._suffix_cache = SuffixDecodingCache(
+                max_tree_depth=spec_cfg.suffix_cache_max_depth,
+                max_cached_requests=spec_cfg.suffix_cache_max_requests)
+
+        # Initialize CPU timing buffer and paths
+        self._cpu_timing_buffer: list[str] = []
+        self._timing_flush_every_n: int = int(_os.getenv("ARCTIC_TIMING_BUFFER_SIZE", "400"))
+        self._timing_flush_every_s: float = float(_os.getenv("ARCTIC_TIMING_FLUSH_SEC", "5"))
+        self._timing_last_flush_time: float = _time.monotonic()
+
+        # Precompute output path for this process
+        root_dir = _os.getenv("ARCTIC_METRICS_DIR", "/data/zshao/tmp/arctic_metrics")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = _os.path.join(root_dir, timestamp)
+        _os.makedirs(output_dir, exist_ok=True)
+        # Propagate to env so other writers use the same timestamped directory
+        _os.environ["ARCTIC_METRICS_DIR"] = output_dir
+        local_rank = _os.getenv("LOCAL_RANK", "0")
+        rank = _os.getenv("RANK", "0")
+        self._timing_file_path_cpu = _os.path.join(
+            output_dir, f"CPU_execution_timing_rank_{rank}_local_{local_rank}.jsonl"
+        )
+
+        # Ensure buffer flushes on process exit
+        _atexit.register(lambda: self._flush_timing_buffer(force=True))
+
+        # ---- Suffix speculation timing buffer ----
+        self._suffix_speculation_buffer: list[str] = []
+        self._suffix_speculation_flush_every_n: int = int(_os.getenv("ARCTIC_SUFFIX_SPECULATION_BUFFER_SIZE", "200"))
+        self._suffix_speculation_flush_every_s: float = float(_os.getenv("ARCTIC_SUFFIX_SPECULATION_FLUSH_SEC", "3"))
+        self._suffix_speculation_last_flush_time: float = _time.monotonic()
+        self._suffix_speculation_file_path = _os.path.join(
+            output_dir, f"suffix_speculation_timing_rank_{rank}_local_{local_rank}.jsonl"
+        )
+        _atexit.register(lambda: self._flush_suffix_speculation_buffer(force=True))
+
+    def get_problem_id_by_request_id(self, req_id: str) -> Optional[str]:
+        """
+        Get problem_id for a specific request ID.
+        
+        Args:
+            req_id: The request ID to look up
+            
+        Returns:
+            The problem_id if found, None otherwise
+        """
+        # Method 1: Use current batch mapping (most efficient and reliable)
+        if hasattr(self, '_current_batch_req_id_to_problem_id'):
+            problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
+            if problem_id is not None:
+                return problem_id
+        
+        # Method 2: Try context manager
+        try:
+            problem_id = ProblemIdContextManager.get_problem_id_for_req_id(req_id)
+            if problem_id is not None:
+                return problem_id
+        except Exception:
+            pass
+        
+        # Method 3: Try to extract from input_batch if available
+        try:
+            if hasattr(self, 'input_batch') and hasattr(self.input_batch, 'req_ids'):
+                req_ids = self.input_batch.req_ids
+                if req_id in req_ids:
+                    index = req_ids.index(req_id)
+                    problem_id = self._get_problem_id_for_index(index)
+                    if problem_id is not None:
+                        return problem_id
+        except Exception:
+            pass
+        
+        print(f"Failed to get problem_id for request {req_id}")
+        return None
+
+    def _get_problem_id_for_index(self, index: int) -> Optional[str]:
+        """Retrieve problem_id for the i-th request if available."""
+        req_id = None
+        try:
+            req_id = self.input_batch.req_ids[index]
+        except Exception:
+            pass
+
+        # First try context manager (highest priority)
+        try:
+            problem_id = ProblemIdContextManager.get_problem_id_for_req_id(req_id)
+            if problem_id is not None:
+                return problem_id
+        except Exception:
+            pass
+
+        # Try input_batch vectorized field first
+        try:
+            problem_ids = getattr(self.input_batch, "problem_id", None)
+            if problem_ids is not None:
+                pid = problem_ids[index]
+                if isinstance(pid, bytes):
+                    pid = pid.decode()
+                # numpy scalar -> python scalar
+                if hasattr(pid, "item"):
+                    pid = pid.item()
+                if isinstance(pid, (list, np.ndarray)):
+                    pid = pid[0] if len(pid) > 0 else None
+                if isinstance(pid, str):
+                    return pid
+        except Exception:
+            pass
+
+        # Fallback: extract a common pattern from req_id
+        if req_id is not None:
+            m = re.search(r"(prob_[0-9]{4,})", str(req_id))
+            if m:
+                return m.group(1)
+        return None
+
+    def _get_hard_and_non_hard_indices(self, top_percent: float = 0.3) -> tuple[list[int], list[int], list[int], list[int]]:
+        """
+        计算当前 batch 中的 hard 和 medium 请求索引。
+
+        基于 ProblemIdContextManager.get_hard_medium_ids() 提供的 problem_id 列表，
+        将属于 hard_ids 的请求划为 hard，将属于 medium_ids 的请求划为 non-hard（此处表示 medium）。
+        其他未列入者不分配配额。
+        """
+        # 优先使用已缓存的索引，以避免在 generate_sequences 的多次 execute_model 调用中重复计算
+        if ProblemIdContextManager.has_hard_medium_indices():
+            cached_hard, cached_medium, cached_easy, cached_allowed_indices = ProblemIdContextManager.get_hard_medium_indices()
+            return cached_hard, cached_medium, cached_easy, cached_allowed_indices
+        else:
+            hard_indices: list[int] = []
+            medium_indices: list[int] = []  
+            easy_indices: list[int] = []
+            hard_ids, medium_ids, easy_ids = ProblemIdContextManager.get_hard_medium_ids()
+            hard_set = set(str(pid) for pid in (hard_ids or []))
+            medium_set = set(str(pid) for pid in (medium_ids or []))
+            easy_set = set(str(pid) for pid in (easy_ids or []))
+            
+            if hasattr(self, 'input_batch') and hasattr(self.input_batch, 'req_ids'):
+                for i, req_id in enumerate(self.input_batch.req_ids):
+                    problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
+                    pid_str = str(problem_id)
+                    if pid_str in hard_set:
+                        hard_indices.append(i)
+                    elif pid_str in medium_set:
+                        medium_indices.append(i)
+                    elif pid_str in easy_set:
+                        easy_indices.append(i)
+            
+            allowed_indices = hard_indices + medium_indices + easy_indices
+            ProblemIdContextManager.set_hard_medium_indices(hard_indices, medium_indices, easy_indices, allowed_indices)
+        
+        return hard_indices, medium_indices, easy_indices, allowed_indices
+
+    def _log_suffix_speculation_timing(self, timing_data):
+        """Log suffix speculation timing data to buffer."""
+        try:
+            self._suffix_speculation_buffer.append(json.dumps(timing_data, default=self._json_serializable))
+            
+            # Flush conditions: buffer size or time threshold
+            should_flush_by_n = len(self._suffix_speculation_buffer) >= self._suffix_speculation_flush_every_n
+            should_flush_by_time = (_time.monotonic() - self._suffix_speculation_last_flush_time) >= self._suffix_speculation_flush_every_s
+            if should_flush_by_n or should_flush_by_time:
+                self._flush_suffix_speculation_buffer()
+        except Exception as e:
+            from vllm.logger import init_logger
+            logger = init_logger(__name__)
+            logger.error(f"Failed to log suffix speculation timing: {e}")
+
+    def _flush_suffix_speculation_buffer(self, force: bool = False):
+        """Flush buffered suffix speculation timing lines to disk."""
+        try:
+            if not self._suffix_speculation_buffer and not force:
+                return
+            
+            if not self._suffix_speculation_buffer:
+                self._suffix_speculation_last_flush_time = _time.monotonic()
+                return
+
+            # Write all pending lines at once
+            with open(self._suffix_speculation_file_path, "a") as f:
+                f.write("\n".join(self._suffix_speculation_buffer) + "\n")
+            self._suffix_speculation_buffer.clear()
+            self._suffix_speculation_last_flush_time = _time.monotonic()
+        except Exception as e:
+            from vllm.logger import init_logger
+            logger = init_logger(__name__)
+            logger.error(f"Failed to flush suffix speculation timing: {e}")
+
+    def _json_serializable(self, obj):
+        """Helper to handle non-serializable objects in JSON."""
+        if hasattr(obj, 'tolist'):
+            return obj.tolist()
+        elif hasattr(obj, '__dict__'):
+            return obj.__dict__
+        else:
+            return str(obj)
 
     def profile_run(self) -> None:
         self._orig_profile_run()
@@ -157,25 +520,25 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             orig_model, self.model = self.model, self.shift_model
             try:
                 with set_shift_parallel_mode(True):
-                    self._dummy_run(self.max_num_tokens)
+                    self._dummy_run(self.max_num_tokens, is_profile=True)
             finally:
                 self.model = orig_model
 
     def _prepare_inputs(self, *args, **kwargs):
-        attn_metadata, logits_indices, *rest = (
+        attn_metadata, attention_cuda_graphs, logits_indices, *rest = (
             self._orig_prepare_inputs(*args, **kwargs))
         # SwiftKV requires knowing the logits indices from inside the model
         # definition in order to early-stop the prefill tokens.
         for meta in attn_metadata.values():
             meta.swiftkv_logits_indices = logits_indices
-        return attn_metadata, logits_indices, *rest
+        return attn_metadata, attention_cuda_graphs, logits_indices, *rest
 
     def monkeypatch_forward(self: GPUModelRunner):
         sp_size = parallel_state._SP.world_size
         sp_rank = parallel_state._SP.rank_in_group
         device_group = parallel_state._SP.device_group
         model_forward = self.model.forward
-        input_key = 'inputs_embeds' if  self.is_multimodal_model else 'input_ids'
+        input_key = 'inputs_embeds' if self.is_multimodal_model else 'input_ids'
 
         def ulysses_forward(*args, **kwargs):
             # update inputs
@@ -197,11 +560,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             if output.size(0) == N_ulysses:
                 # all-gather model_output
                 model_output = torch.empty((N, self.hidden_size),
-                                        dtype=output.dtype,
-                                        device=output.device)
+                                           dtype=output.dtype,
+                                           device=output.device)
                 torch.distributed.all_gather_into_tensor(model_output,
-                                                        output,
-                                                        group=device_group)
+                                                         output,
+                                                         group=device_group)
             else:
                 # SwiftKV models will already have all-gathered the output.
                 assert output.size(0) == N
@@ -210,56 +573,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         self.model.forward = ulysses_forward
 
-    def load_model(self: GPUModelRunner, *args, **kwargs):
-        load_shift_model = (
-            self.vllm_config.parallel_config.enable_shift_parallel)
-
-        if load_shift_model:
-            # Make a deep copy of the config before loading the model.
-            shift_config = copy.deepcopy(self.vllm_config)
-
-        self._orig_load_model(*args, **kwargs)
-
-        if self.parallel_config.ulysses_sequence_parallel_size > 1:
-            self.monkeypatch_forward()
-
-        if load_shift_model:
-            shift_config.parallel_config.tensor_parallel_size *= (
-                shift_config.parallel_config.ulysses_sequence_parallel_size)
-            shift_config.parallel_config.ulysses_sequence_parallel_size = 1
-            with set_shift_parallel_mode(True):
-                self.shift_model = get_model(vllm_config=shift_config)
-            self.shift_parallel_threshold = (
-                shift_config.parallel_config.shift_parallel_threshold)
-            if "SwiftKV" in self.model.__class__.__name__:
-                # HACK: Replace the decode-runner since it always runs in full
-                # TP, but the original model is captured using SP * BATCH_SIZE,
-                # which does not cover all its cuda graph sizes. The shift-mode
-                # model should have all its cuda graphs captured correctly.
-                self.model.model.decode_runner = (
-                    self.shift_model.model.decode_runner)
-        else:
-            self.shift_model = None
-            self.shift_parallel_threshold = 0
-
-    def initialize_kv_cache(self, kv_cache_config: "KVCacheConfig") -> None:
-        self._orig_initialize_kv_cache(kv_cache_config)
-
-        if self.shift_model is not None:
-            # Bind the KV caches to the shift parallel model.
-            forward_context = (
-                self.vllm_config.compilation_config.static_forward_context)
-            for mod in self.shift_model.modules():
-                if isinstance(mod, Attention):
-                    mod.kv_cache = forward_context[mod.layer_name].kv_cache
-
     @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
-
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
@@ -269,39 +588,41 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             return self.kv_connector_no_forward(scheduler_output)
 
         # Prepare the decoder inputs.
-        attn_metadata, logits_indices, spec_decode_metadata = (
-            self._prepare_inputs(scheduler_output))
+        (attn_metadata, attention_cuda_graphs, logits_indices,
+         spec_decode_metadata,
+         num_scheduled_tokens_np) = (self._prepare_inputs(scheduler_output))
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        use_shift_model = (
-            self.use_ulysses and self.shift_model is not None and
-            num_scheduled_tokens <= self.shift_parallel_threshold)
+        use_shift_model = (self.use_ulysses and self.shift_model is not None
+                           and num_scheduled_tokens
+                           <= self.shift_parallel_threshold)
         if self.use_ulysses and not use_shift_model:
             # add padding to the batch size to make it a multiple of SP
-            from vllm.utils import round_up
             sp_size = self.parallel_config.ulysses_sequence_parallel_size
             num_input_tokens = round_up(num_scheduled_tokens, sp_size)
             if (self.use_cuda_graph and num_input_tokens // sp_size
                     <= self.cudagraph_batch_sizes[-1]):
                 num_input_tokens = self.vllm_config.pad_for_cudagraph(
                     num_input_tokens // sp_size) * sp_size
+        elif (self.use_cuda_graph
+              and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
+            # Use piecewise CUDA graphs.
+            # Add padding to the batch size.
+            num_input_tokens = self.vllm_config.pad_for_cudagraph(
+                num_scheduled_tokens)
         else:
-            if (self.use_cuda_graph
-                    and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
-                # Use piecewise CUDA graphs.
-                # Add padding to the batch size.
-                num_input_tokens = self.vllm_config.pad_for_cudagraph(
-                    num_scheduled_tokens)
+            # Eager mode.
+            # Pad tokens to multiple of tensor_parallel_size when
+            # enabled collective fusion for SP
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            if self.compilation_config.pass_config. \
+                enable_sequence_parallelism and tp_size > 1:
+                num_input_tokens = round_up(num_scheduled_tokens, tp_size)
             else:
-                # Eager mode.
-                # Pad tokens to multiple of tensor_parallel_size when
-                # enabled collective fusion for SP
-                tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-                if self.vllm_config.compilation_config.pass_config. \
-                    enable_sequence_parallelism and tp_size > 1:
-                    from vllm.utils import round_up
-                    num_input_tokens = round_up(num_scheduled_tokens, tp_size)
-                else:
-                    num_input_tokens = num_scheduled_tokens
+                num_input_tokens = num_scheduled_tokens
+
+        # Padding for DP
+        num_pad, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
+        num_input_tokens += num_pad
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
@@ -344,11 +665,20 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True)
 
-        # Run the decoder.
+        # Some attention backends only support CUDA Graphs in pure decode.
+        # If attention doesn't support CUDA Graphs for this batch, but we
+        # compiled with full CUDA graphs, we have to skip them entirely.
+        skip_cuda_graphs = self.full_cuda_graph and not attention_cuda_graphs
+
+        # Run the model.
         # Use persistent buffers for CUDA graphs.
-        with set_forward_context(attn_metadata,
-                                 self.vllm_config,
-                                 num_tokens=num_input_tokens):
+        with set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                skip_cuda_graphs=skip_cuda_graphs,
+        ):
             self.maybe_setup_kv_connector(scheduler_output)
 
             model = self.shift_model if use_shift_model else self.model
@@ -368,6 +698,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             hidden_states, aux_hidden_states = model_output
         else:
             hidden_states = model_output
+            aux_hidden_states = None
+
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
@@ -384,6 +716,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                                             all_gather_group=get_tp_group())
             logits = None
         else:
+            if self.input_batch.pooling_params:
+                return self._pool(hidden_states, num_scheduled_tokens,
+                                  num_scheduled_tokens_np, finished_sending,
+                                  finished_recving)
+
             sample_hidden_states = hidden_states[logits_indices]
             logits = self.model.compute_logits(sample_hidden_states, None)
         if broadcast_pp_output:
@@ -432,6 +769,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             )
             sampler_output.sampled_token_ids = output_token_ids
 
+        num_nans_in_logits = {}
+        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+            num_nans_in_logits = self._get_nans_in_logits(logits)
+
         # TODO(woosuk): The following loop can be slow since it iterates over
         # the requests one by one. Optimize.
         discard_sampled_tokens_req_indices = []
@@ -478,159 +819,149 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
 
-        disable_spec_decode = (
-            self.speculative_config and
-            self.speculative_config.disable_by_batch_size and
-            len(self.input_batch.req_ids) > self.speculative_config.disable_by_batch_size
-        )
+        # Cache the sampled tokens in the model runner, so that the scheduler
+        # doesn't need to send them back.
+        # NOTE(woosuk): As an exception, when using PP, the scheduler sends
+        # the sampled tokens back, because there's no direct communication
+        # between the first-stage worker and the last-stage worker.
+        for req_idx, sampled_ids in enumerate(valid_sampled_token_ids):
+            if not sampled_ids:
+                continue
 
-        suffix_spec_token_ids = None
-        orig_sampled_token_ids = valid_sampled_token_ids.copy()
+            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+            end_idx = start_idx + len(sampled_ids)
+            assert end_idx <= self.max_model_len, (
+                "Sampled token IDs exceed the max model length. "
+                f"Total number of tokens: {end_idx} > max_model_len: "
+                f"{self.max_model_len}")
+
+            self.input_batch.token_ids_cpu[req_idx,
+                                           start_idx:end_idx] = sampled_ids
+            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+            self.input_batch.num_tokens[req_idx] = end_idx
+            req_id = self.input_batch.req_ids[req_idx]
+            req_state = self.requests[req_id]
+            req_state.output_token_ids.extend(sampled_ids)
+
         if self._suffix_cache is not None:
             self._update_suffix_cache(valid_sampled_token_ids)
-            if not disable_spec_decode:
-                results = self.generate_draft_token_ids_suffix(
-                    valid_sampled_token_ids)
-                suffix_spec_token_ids = []
-                # The score is an estimate of the acceptance length. Thus, the
-                # heuristic is to use the suffix decoded tokens if the score is
-                # greater than the # of tokens we would speculate otherwise.
-                min_score = (self.speculative_config.num_speculative_tokens
-                             if self.speculative_config.method != "suffix"
-                             else 0)
-                min_score = (0 if self.speculative_config.method == "suffix"
-                             else self.speculative_config.num_speculative_tokens)
-                for i, result in enumerate(results):
-                    if result.score >= min_score:
-                        # Use suffix decoded tokens, disable other speculation
-                        # methods for this request.
-                        valid_sampled_token_ids[i] = []
-                        suffix_spec_token_ids.append(result.token_ids)
-                    else:
-                        suffix_spec_token_ids.append([])
+
+        # Start CPU execution time profiling for suffix tree decoding
+        torch.cuda.synchronize()
+        cpu_execution_start_time = time.perf_counter()
+        cpu_execution_start_timestamp = datetime.now().isoformat()
+        batch_size = len(self.input_batch.req_ids)
+
+        if not self.speculative_config:
+            # Speculative decoding is not enabled.
+            spec_token_ids = None
+        else:
+            spec_token_ids = self.propose_draft_token_ids(
+                scheduler_output,
+                valid_sampled_token_ids,
+                sampler_output.sampled_token_ids,
+                sampling_metadata,
+                hidden_states,
+                sample_hidden_states,
+                aux_hidden_states,
+                spec_decode_metadata,
+                attn_metadata,
+            )
+
+        # Record CPU execution time after suffix tree decoding
+        torch.cuda.synchronize()
+        cpu_execution_end_time = time.perf_counter()
+        cpu_execution_duration = cpu_execution_end_time - cpu_execution_start_time
+        self._log_execution_time(cpu_execution_start_timestamp, cpu_execution_duration, batch_size, 
+                                scheduler_output.total_num_scheduled_tokens, early_return=False)
+
+        # Clear KVConnector state after all KVs are generated.
+        if has_kv_transfer_group():
+            get_kv_transfer_group().clear_connector_metadata()
+
+        self.eplb_step()
+
+        return ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids,
+            req_id_to_index=self.input_batch.req_id_to_index,
+            sampled_token_ids=valid_sampled_token_ids,
+            spec_token_ids=spec_token_ids,
+            logprobs=logprobs_lists,
+            prompt_logprobs_dict=prompt_logprobs_dict,
+            pooler_output=[],
+            finished_sending=finished_sending,
+            finished_recving=finished_recving,
+            num_nans_in_logits=num_nans_in_logits,
+        )
+
+    def propose_draft_token_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampled_token_ids: list[list[int]],
+        original_sampled_token_ids: np.ndarray,
+        sampling_metadata: SamplingMetadata,
+        hidden_states: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+        aux_hidden_states: Optional[torch.Tensor],
+        spec_decode_metadata: Optional[SpecDecodeMetadata],
+        attn_metadata: dict[str, Any],
+    ) -> list[list[int]]:
+        disable_spec_decode = (self.speculative_config and
+                               self.speculative_config.disable_by_batch_size
+                               and len(self.input_batch.req_ids)
+                               > self.speculative_config.disable_by_batch_size)
+        if disable_spec_decode:
+            # No speculative decoding is enabled.
+            return [[] for _ in sampled_token_ids]
+
+        suffix_spec_token_ids = None
+        new_sampled_token_ids = sampled_token_ids.copy()
+        if self._suffix_cache is not None:
+            results = self.propose_suffix_draft_token_ids(
+                new_sampled_token_ids)
+            suffix_spec_token_ids = []
+            # The score is an estimate of the acceptance length. Thus, the
+            # heuristic is to use the suffix decoded tokens if the score is
+            # greater than the # of tokens we would speculate otherwise.
+            min_score = (self.speculative_config.num_speculative_tokens
+                         if self.speculative_config.method != "suffix" else 0)
+            min_score = (0 if self.speculative_config.method == "suffix" else
+                         self.speculative_config.num_speculative_tokens)
+            for i, result in enumerate(results):
+                if result.score >= min_score:
+                    # Use suffix decoded tokens, disable other speculation
+                    # methods for this request.
+                    new_sampled_token_ids[i] = []
+                    suffix_spec_token_ids.append(result.token_ids)
+                else:
+                    suffix_spec_token_ids.append([])
 
         spec_token_ids = None
-        if not self.use_spec_decode or disable_spec_decode:
-            # Speculative decoding is not enabled.
+        if self.speculative_config.method == "suffix":
             pass
-        elif (self.speculative_config.method == "arctic" or 
-              self.speculative_config.method == "mlp_speculator"):
+        elif (self.speculative_config.method == "arctic"
+              or self.speculative_config.method == "mlp_speculator"):
             assert isinstance(self.drafter, ArcticProposer)
             previous_hidden_states = self.drafter.prepare_hidden_states(
                 sample_hidden_states=sample_hidden_states,
-                sampled_token_ids=sampled_token_ids,
+                sampled_token_ids=original_sampled_token_ids,
                 spec_decode_metadata=spec_decode_metadata,
             )
-            spec_token_ids = self.generate_draft_token_ids_arctic(
+            spec_token_ids = self.propose_arctic_draft_token_ids(
                 scheduler_output,
-                valid_sampled_token_ids, 
+                new_sampled_token_ids,
                 previous_hidden_states=previous_hidden_states)
-        elif self.speculative_config.method == "ngram":
-            assert isinstance(self.drafter, NgramProposer)
-            spec_token_ids = self.generate_draft_token_ids(
-                valid_sampled_token_ids, sampling_metadata)
-        elif self.speculative_config.method == "medusa":
-            assert isinstance(self.drafter, MedusaProposer)
-            if max_gen_len == 1:
-                hidden_states = sample_hidden_states
-            else:
-                indices = []
-                offset = 0
-                for num_draft, tokens in zip(
-                        spec_decode_metadata.num_draft_tokens,
-                        valid_sampled_token_ids):
-                    indices.append(offset + len(tokens) - 1)
-                    offset += num_draft + 1
-
-                indices = torch.tensor(indices,
-                                       device=sample_hidden_states.device)
-                hidden_states = sample_hidden_states[indices]
-
-            spec_token_ids = self.drafter.propose(
-                target_hidden_states=hidden_states,
-                sampling_metadata=sampling_metadata,
+        else:
+            spec_token_ids = self._orig_propose_draft_token_ids(
+                scheduler_output,
+                new_sampled_token_ids,
+                sampling_metadata,
+                hidden_states,
+                sample_hidden_states,
+                aux_hidden_states,
+                spec_decode_metadata,
+                attn_metadata,
             )
-        elif self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
-            # TODO(woosuk): Refactor the loop.
-            next_token_ids: list[int] = []
-            for i, token_ids in enumerate(valid_sampled_token_ids):
-                if token_ids:
-                    # Common case.
-                    next_token_id = token_ids[-1]
-                else:
-                    # Partial prefill (rare case).
-                    # Get the next token id from the request state.
-                    req_id = self.input_batch.req_ids[i]
-                    req_state = self.requests[req_id]
-                    seq_len = (req_state.num_computed_tokens +
-                               scheduler_output.num_scheduled_tokens[req_id])
-                    next_token_id = req_state.get_token_id(seq_len)
-                next_token_ids.append(next_token_id)
-            next_token_ids = torch.tensor(next_token_ids,
-                                          dtype=torch.int32,
-                                          device=self.device)
-            # At this moment, we assume all eagle layers belong to the same KV
-            # cache group, thus using the same attention metadata.
-            eagle_attn_metadata = attn_metadata[
-                self.drafter.attn_layer_names[0]]
-
-            # NOTE: deepseek_mtp uses MLA which does not have `block_table`
-            if hasattr(eagle_attn_metadata, "block_table"):
-                block_table = eagle_attn_metadata.block_table
-            else:
-                block_table = None
-
-            if spec_decode_metadata is None:
-                # input_ids can be None for multimodal models.
-                target_token_ids = self.input_ids[:num_scheduled_tokens]
-                target_positions = positions[:num_scheduled_tokens]
-                if self.use_aux_hidden_state_outputs:
-                    target_hidden_states = torch.cat(
-                        [h[:num_scheduled_tokens] for h in aux_hidden_states],
-                        dim=-1)
-                else:
-                    target_hidden_states = hidden_states[:num_scheduled_tokens]
-                target_slot_mapping = eagle_attn_metadata.slot_mapping
-                cu_num_tokens = eagle_attn_metadata.query_start_loc
-            else:
-                # TODO(woosuk): Refactor this.
-                num_draft_tokens = spec_decode_metadata.num_draft_tokens
-                num_rejected_tokens = [
-                    n + 1 - len(valid_sampled_token_ids[i]) if n > 0 else 0
-                    for i, n in enumerate(num_draft_tokens)
-                ]
-                num_rejected_tokens_tensor = async_tensor_h2d(
-                    num_rejected_tokens,
-                    dtype=torch.int32,
-                    target_device=self.device,
-                    pin_memory=True)
-                num_tokens = num_scheduled_tokens - sum(num_rejected_tokens)
-                cu_num_tokens, token_indices = self.drafter.prepare_inputs(
-                    eagle_attn_metadata.query_start_loc,
-                    num_rejected_tokens_tensor,
-                    num_tokens,
-                )
-                target_token_ids = self.input_ids[token_indices]
-                target_positions = positions[token_indices]
-                if self.use_aux_hidden_state_outputs:
-                    target_hidden_states = torch.cat(
-                        [h[token_indices] for h in aux_hidden_states], dim=-1)
-                else:
-                    target_hidden_states = hidden_states[token_indices]
-                target_slot_mapping = eagle_attn_metadata.slot_mapping[
-                    token_indices]
-            draft_token_ids = self.drafter.propose(
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                target_slot_mapping=target_slot_mapping,
-                next_token_ids=next_token_ids,
-                cu_num_tokens=cu_num_tokens,
-                block_table=block_table,
-                sampling_metadata=sampling_metadata,
-            )
-            spec_token_ids = draft_token_ids.tolist()
 
         if spec_token_ids is None:
             spec_token_ids = suffix_spec_token_ids
@@ -640,37 +971,19 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 for i in range(len(suffix_spec_token_ids))
             ]
 
-        if disable_spec_decode and spec_token_ids is None:
-            # No speculative decoding is enabled.
-            spec_token_ids = [[]] * len(orig_sampled_token_ids)
+        return spec_token_ids
 
-        valid_sampled_token_ids = orig_sampled_token_ids
-
-        # Clear KVConnector state after all KVs are generated.
-        if has_kv_transfer_group():
-            get_kv_transfer_group().clear_connector_metadata()
-
-        return ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids=valid_sampled_token_ids,
-            spec_token_ids=spec_token_ids,
-            logprobs=logprobs_lists,
-            prompt_logprobs_dict=prompt_logprobs_dict,
-            finished_sending=finished_sending,
-            finished_recving=finished_recving,
-        )
-    
-    def generate_draft_token_ids_arctic(
+    def propose_arctic_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
         sampled_token_ids: list[list[int]],
         previous_hidden_states: Optional[torch.Tensor] = None,
     ) -> list[list[int]]:
-        last_tokens : list[int] = []
+        last_tokens: list[int] = []
+        max_spec_tokens = self.speculative_config.num_speculative_tokens
         for i, sampled_ids in enumerate(sampled_token_ids):
             num_sampled_ids = len(sampled_ids)
-            
+
             if (num_sampled_ids == 0):
                 if self.speculative_config.enable_suffix_decoding:
                     return [[]] * len(sampled_token_ids)
@@ -683,12 +996,25 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # Add sampled_token_ids to token_ids_cpu.
             start_idx = self.input_batch.num_tokens_no_spec[i]
             end_idx = start_idx + num_sampled_ids
-            self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids[-1]
+
+            max_spec_tokens = min(
+                max_spec_tokens,
+                self.max_model_len - end_idx - 1,
+            )
+            if max_spec_tokens <= 0:
+                continue
+
+            self.input_batch.token_ids_cpu[i,
+                                           start_idx:end_idx] = sampled_ids[-1]
             last_tokens.append(self.input_batch.token_ids_cpu[i, end_idx - 1])
+
+        if max_spec_tokens <= 0:
+            return [[] for _ in sampled_token_ids]
 
         drafter_output = self.drafter.propose(
             last_tokens,
             previous_hidden_states=previous_hidden_states,
+            num_predict_tokens=max_spec_tokens,
         )
 
         draft_token_ids = drafter_output.tolist()
@@ -709,32 +1035,82 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 continue
 
             index = self.input_batch.req_id_to_index[req_id]
-            if not self._suffix_cache.has_cached_prompt(req_id):
+            if req_id not in self._suffix_cache.active_requests:
+                if req_id in self._suffix_cache.cached_requests:
+                    # Reset the suffix cache for this request.
+                    self._suffix_cache.evict_cached_response(req_id)
                 num_prompt_tokens = self.input_batch.num_prompt_tokens[index]
                 prompt_token_ids = (
                     self.input_batch.token_ids_cpu[index, :num_prompt_tokens])
-                self._suffix_cache.cache_prompt(req_id, prompt_token_ids)
+                self._suffix_cache.start_request(req_id, prompt_token_ids)
 
-            self._suffix_cache.update_response(req_id, sampled_ids)
+            # Get problem_id for this request
+            problem_id = self.get_problem_id_by_request_id(req_id)
+            
+            self._suffix_cache.add_active_response(req_id, sampled_ids, problem_id)
 
-        # Evict prompts that are not seen
-        for req_id in self._suffix_cache.cached_prompt_ids():
+        # Stop requests that are not seen
+        for req_id in list(self._suffix_cache.active_requests):
             if req_id not in seen_req_ids:
-                self._suffix_cache.evict_prompt(req_id)
+                self._suffix_cache.stop_request(req_id)
 
-    def generate_draft_token_ids_suffix(
+    def propose_suffix_draft_token_ids(
         self,
         sampled_token_ids: list[list[int]],
         spec_token_ids: Optional[list[list[int]]] = None,
     ) -> list[list[int]]:
+        # Start timing for overall method
+        method_start_time = _time.perf_counter()
+        
         config = self.speculative_config
+        batch_size = len(sampled_token_ids)
+        
+        # Timing: Get hard/medium/easy indices
+        # indices_start_time = _time.perf_counter()
+        hard_indices, medium_indices, easy_indices, allowed_indices = self._get_hard_and_non_hard_indices()
+        # indices_time = _time.perf_counter() - indices_start_time
+        
+        # Define spec parameters based on problem difficulty and batch size
+        hard_spec, hard_prob, hard_spec_factor = 16, 0.1, 2
+        medium_spec, medium_prob, medium_spec_factor = 8, 0.1, 1
+        easy_spec, easy_prob, easy_spec_factor = 4, 0.1, 1
+        
+        # Adjust parameters based on batch size
+        if batch_size <= 64:
+            medium_spec, medium_prob, medium_spec_factor = 16, 0.1, 2
+            easy_spec, easy_prob, easy_spec_factor = 16, 0.1, 2
+        elif batch_size <= 128:
+            medium_spec, medium_prob, medium_spec_factor = 16, 0.1, 2
+            easy_spec, easy_prob, easy_spec_factor = 8, 0.1, 1
+        
+        # # Log differentiated processing info if we have categorized requests
+        # if hard_indices or medium_indices or easy_indices:
+        #     from vllm.logger import init_logger
+        #     logger = init_logger(__name__)
+        #     logger.debug(f"Differentiated speculation - Batch size: {batch_size}, "
+        #                 f"Hard: {len(hard_indices)} (spec={hard_spec}), "
+        #                 f"Medium: {len(medium_indices)} (spec={medium_spec}), "
+        #                 f"Easy: {len(easy_indices)} (spec={easy_spec})")
+        
+        # # Timing: Start processing loop
+        # processing_start_time = _time.perf_counter()
+        # speculation_times = []
         results = []
         for i, sampled_ids in enumerate(sampled_token_ids):
+            # Timing: Start individual request processing
+            request_start_time = _time.perf_counter()
+            
             spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
             num_sampled_ids = len(sampled_ids)
             if not num_sampled_ids:
                 # Skip speculative decoding.
-                results.append(SuffixSpecResult())
+                results.append(SuffixDecodingDraft())
+                # speculation_times.append({
+                #     "request_index": i,
+                #     "processing_time_ms": (_time.perf_counter() - request_start_time) * 1000,
+                #     "skipped": True,
+                #     "reason": "no_sampled_ids"
+                # })
                 continue
 
             req_id = self.input_batch.req_ids[i]
@@ -742,16 +1118,53 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # Add sampled_token_ids to token_ids_cpu.
             start_idx = self.input_batch.num_tokens_no_spec[i]
             end_idx = start_idx + len(sampled_ids)
+
+            if end_idx >= self.max_model_len:
+                results.append(SuffixDecodingDraft())
+                self.input_batch.token_ids_cpu[
+                    i, start_idx:self.
+                    max_model_len] = sampled_ids[:self.max_model_len -
+                                                 start_idx]
+                # speculation_times.append({
+                #     "request_index": i,
+                #     "processing_time_ms": (_time.perf_counter() - request_start_time) * 1000,
+                #     "skipped": True,
+                #     "reason": "max_model_len_exceeded"
+                # })
+                continue
+
             self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
 
             size = min(end_idx, config.suffix_cache_max_depth)
-            pattern = self.input_batch.token_ids_cpu[i, end_idx-size:end_idx]
+            pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx]
             pattern = pattern.tolist() + spec_ids
             if len(pattern) > config.suffix_cache_max_depth:
                 pattern = pattern[-config.suffix_cache_max_depth:]
-            max_spec_tokens = min(MAX_SPEC_LEN - len(spec_ids),
-                                  config.suffix_cache_max_depth,
-                                  self.max_model_len - end_idx - 1)
+            # Determine spec parameters based on problem difficulty
+            # current_spec_tokens = 5  # default
+            current_min_prob = config.suffix_min_token_prob  # default
+            current_spec_factor = config.suffix_max_spec_factor  # default
+            
+            if i in hard_indices:
+                current_spec_tokens = hard_spec
+                current_min_prob = hard_prob
+                current_spec_factor = hard_spec_factor
+            elif i in medium_indices:
+                current_spec_tokens = medium_spec
+                current_min_prob = medium_prob
+                current_spec_factor = medium_spec_factor
+            elif i in easy_indices:
+                current_spec_tokens = easy_spec
+                current_min_prob = easy_prob
+                current_spec_factor = easy_spec_factor
+            
+            max_spec_tokens = min(
+                MAX_SPEC_LEN - len(spec_ids),
+                config.suffix_cache_max_depth,
+                self.max_model_len - end_idx - 1,
+                current_spec_tokens
+            )
+            
             # max_spec_offset is modified to mimic the behavior of the original
             # max_spec_factor and max_spec_offset as if the speculative tokens
             # were generated by suffix decoding. For example, if:
@@ -764,27 +1177,150 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             #   - The original config allow up to 5 speculated tokens total
             #   - Already speculated 3 tokens, so should allow 2 more tokens
             # So the new config should map match length 6 to 2 max spec tokens.
-            max_spec_factor = config.suffix_max_spec_factor
-            max_spec_offset = (config.suffix_max_spec_offset -
-                              len(spec_ids) * (max_spec_factor + 1))
-            result = self._suffix_cache.speculate(
+            max_spec_factor = current_spec_factor
+            max_spec_offset = (config.suffix_max_spec_offset - len(spec_ids) *
+                               (max_spec_factor + 1))
+            # Get problem_id for this request
+            req_id = self.input_batch.req_ids[i]
+            problem_id = self.get_problem_id_by_request_id(req_id)
+            
+            # # Determine difficulty category for this request
+            # difficulty_category = "default"
+            # if i in hard_indices:
+            #     difficulty_category = "hard"
+            # elif i in medium_indices:
+            #     difficulty_category = "medium"
+            # elif i in easy_indices:
+            #     difficulty_category = "easy"
+            
+            # Timing: Start speculation
+            # speculation_start_time = _time.perf_counter()
+            
+            result, source = self._suffix_cache.speculate(
                 req_id,
                 pattern,
                 max_spec_tokens=max_spec_tokens,
                 max_spec_factor=max_spec_factor,
                 max_spec_offset=max_spec_offset,
-                min_token_prob=config.suffix_min_token_prob)
+                min_token_prob=current_min_prob,
+                problem_id=problem_id,
+            )
+            
+            # speculation_time = _time.perf_counter() - speculation_start_time
+            # request_total_time = _time.perf_counter() - request_start_time
+
+            # # Record timing data for this request
+            # speculation_times.append({
+            #     "request_index": i,
+            #     "req_id": req_id,
+            #     "problem_id": problem_id,
+            #     "difficulty_category": difficulty_category,
+            #     "speculation_time_ms": speculation_time * 1000,
+            #     "total_request_time_ms": request_total_time * 1000,
+            #     "spec_params": {
+            #         "max_spec_tokens": max_spec_tokens,
+            #         "max_spec_factor": max_spec_factor,
+            #         "min_token_prob": current_min_prob
+            #     },
+            #     "result_score": result.score if hasattr(result, 'score') else 0,
+            #     "result_tokens": len(result.token_ids) if hasattr(result, 'token_ids') else 0,
+            #     "source": source,
+            #     "pattern_length": len(pattern),
+            #     "skipped": False
+            # })
 
             results.append(result)
 
+        # Calculate total processing time
+        # processing_time = _time.perf_counter() - processing_start_time
+        # method_total_time = _time.perf_counter() - method_start_time
+
+        # Aggregate timing statistics
+        # total_speculation_time = sum(t.get("speculation_time_ms", 0) for t in speculation_times if not t.get("skipped", False))
+        # avg_speculation_time = total_speculation_time / max(1, len([t for t in speculation_times if not t.get("skipped", False)]))
+        
+        # # # Count by difficulty
+        # hard_count = len([t for t in speculation_times if t.get("difficulty_category") == "hard"])
+        # medium_count = len([t for t in speculation_times if t.get("difficulty_category") == "medium"])
+        # easy_count = len([t for t in speculation_times if t.get("difficulty_category") == "easy"])
+        # default_count = len([t for t in speculation_times if t.get("difficulty_category") == "default"])
+        # skipped_count = len([t for t in speculation_times if t.get("skipped", False)])
+
+        # Log comprehensive timing data
+        # timing_data = {
+        #     "timestamp": method_start_time,
+        #     "call_type": "propose_suffix_draft_token_ids",
+        #     "batch_size": batch_size,
+        #     "method_total_time_ms": method_total_time * 1000,
+        #     "indices_calculation_time_ms": indices_time * 1000,
+        #     "processing_time_ms": processing_time * 1000,
+        #     "total_speculation_time_ms": total_speculation_time,
+        #     "avg_speculation_time_ms": avg_speculation_time,
+        #     "difficulty_distribution": {
+        #         "hard": hard_count,
+        #         "medium": medium_count,
+        #         "easy": easy_count,
+        #         "default": default_count,
+        #         "skipped": skipped_count
+        #     },
+        #     "spec_parameters": {
+        #         "hard": {"spec": hard_spec, "prob": hard_prob, "factor": hard_spec_factor},
+        #         "medium": {"spec": medium_spec, "prob": medium_prob, "factor": medium_spec_factor},
+        #         "easy": {"spec": easy_spec, "prob": easy_prob, "factor": easy_spec_factor}
+        #     },
+        #     "individual_requests": speculation_times,
+        #     "process_info": {
+        #         "rank": int(_os.getenv("RANK", "0")),
+        #         "local_rank": int(_os.getenv("LOCAL_RANK", "0"))
+        #     }
+        # }
+        
+        # Log the timing data
+        # self._log_suffix_speculation_timing(timing_data)
+
         return results
+
+    def load_model(self) -> None:
+        load_shift_model = (
+            self.vllm_config.parallel_config.enable_shift_parallel)
+
+        if load_shift_model:
+            # Make a deep copy of the config before loading the model.
+            shift_config = copy.deepcopy(self.vllm_config)
+
+        self._orig_load_model()
+
+        if self.parallel_config.ulysses_sequence_parallel_size > 1:
+            self.monkeypatch_forward()
+
+        if load_shift_model:
+            shift_config.parallel_config.tensor_parallel_size *= (
+                shift_config.parallel_config.ulysses_sequence_parallel_size)
+            shift_config.parallel_config.ulysses_sequence_parallel_size = 1
+            with set_shift_parallel_mode(True):
+                self.shift_model = get_model(vllm_config=shift_config)
+            self.shift_parallel_threshold = (
+                shift_config.parallel_config.shift_parallel_threshold)
+            if "SwiftKV" in self.model.__class__.__name__:
+                # HACK: Replace the decode-runner since it always runs in full
+                # TP, but the original model is captured using SP * BATCH_SIZE,
+                # which does not cover all its cuda graph sizes. The shift-mode
+                # model should have all its cuda graphs captured correctly.
+                self.model.model.decode_runner = (
+                    self.shift_model.model.decode_runner)
+        else:
+            self.shift_model = None
+            self.shift_parallel_threshold = 0
 
     def capture_model(self) -> None:
         if not self.use_cuda_graph:
             logger.warning(
-                "Skipping CUDA graph capture. Please add "
-                "-O %s to use CUDA graphs.", CompilationLevel.PIECEWISE)
+                "Skipping CUDA graph capture. To turn on CUDA graph capture, "
+                "set -O %s and ensure `use_cudagraph` was not manually set to "
+                "False", CompilationLevel.PIECEWISE)
             return
+
+        compilation_counter.num_gpu_runner_capture_triggers += 1
 
         start_time = time.perf_counter()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
@@ -792,32 +1328,60 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        skip_attn = not self.vllm_config.compilation_config.full_cuda_graph
         with parallel_state.graph_capture(device=self.device):
             sp_size = self.parallel_config.ulysses_sequence_parallel_size
-            for num_tokens in reversed(self.cudagraph_batch_sizes):
-                if (num_tokens * sp_size > self.shift_parallel_threshold and
-                      num_tokens * sp_size <= self.max_num_tokens):
-                    for _ in range(self.vllm_config.compilation_config.
-                                   cudagraph_num_of_warmups):
-                        self._dummy_run(num_tokens * sp_size,
-                                        skip_attn=skip_attn)
-                    self._dummy_run(num_tokens * sp_size, skip_attn=skip_attn)
+            full_cg = self.full_cuda_graph
+            # capture original model shapes
+            compilation_cases = (
+                shape for shape in reversed(self.cudagraph_batch_sizes)
+                if shape * sp_size > self.shift_parallel_threshold and shape *
+                sp_size <= self.max_num_tokens)
+            # Only rank 0 should print progress bar during capture
+            if is_global_first_rank():
+                print_cases, compilation_cases = tee(compilation_cases)
+                logger.info(f"original model shapes {list(print_cases)}")
+                compilation_cases = tqdm(
+                    list(compilation_cases),
+                    desc="Capturing CUDA graph shapes of original model")
+            for num_tokens in compilation_cases:
+                # We skip EPLB here since we don't want to record dummy metrics
+                for _ in range(self.vllm_config.compilation_config.
+                               cudagraph_num_of_warmups):
+                    self._dummy_run(num_tokens * sp_size,
+                                    capture_attn_cudagraph=full_cg,
+                                    skip_eplb=True)
+                self._dummy_run(num_tokens * sp_size,
+                                capture_attn_cudagraph=full_cg,
+                                skip_eplb=True)
 
+            # Capture shift model shapes
             if self.shift_model is not None:
                 orig_model, self.model = self.model, self.shift_model
-                for num_tokens in reversed(self.cudagraph_batch_sizes):
-                    if (num_tokens <= self.shift_parallel_threshold or 
-                          "SwiftKV" in self.model.__class__.__name__):
-                        # Note: We want to capture all shapes for the SwiftKV shift model.
-                        # This is necessary since SwiftKV always uses full TP for the decode runner.
-                        # For all other models, we only capture necessary shapes for the SP_TP mode,
-                        # yealding less setup time.
-                        with set_shift_parallel_mode(True):
-                            for _ in range(self.vllm_config.compilation_config.
-                                            cudagraph_num_of_warmups):
-                                self._dummy_run(num_tokens, skip_attn=skip_attn)
-                            self._dummy_run(num_tokens, skip_attn=skip_attn)
+                # Reset compilation cases
+                compilation_cases = (
+                    shape for shape in reversed(self.cudagraph_batch_sizes)
+                    if shape <= self.shift_parallel_threshold
+                    or "SwiftKV" in self.model.__class__.__name__)
+                # Note: We want to capture all shapes for the SwiftKV shift model.
+                # This is necessary since SwiftKV always uses full TP for the decode runner.
+                # For all other models, we only capture necessary shapes for the SP_TP mode,
+                # yielding less setup time.
+                if is_global_first_rank():
+                    print_cases, compilation_cases = tee(compilation_cases)
+                    logger.info(f"shift model shapes {list(print_cases)}")
+                    compilation_cases = tqdm(
+                        list(compilation_cases),
+                        desc="Capturing CUDA graph shapes of shift model")
+                with set_shift_parallel_mode(True):
+                    for num_tokens in compilation_cases:
+                        for _ in range(self.vllm_config.compilation_config.
+                                       cudagraph_num_of_warmups):
+                            self._dummy_run(num_tokens,
+                                            capture_attn_cudagraph=full_cg,
+                                            skip_eplb=True)
+                        self._dummy_run(num_tokens,
+                                        capture_attn_cudagraph=full_cg,
+                                        skip_eplb=True)
                 self.model = orig_model
 
         end_time = time.perf_counter()
@@ -827,3 +1391,83 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # This usually takes 5~20 seconds.
         logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
                     elapsed_time, cuda_graph_size / (1 << 30))
+
+    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        self._orig_initialize_kv_cache(kv_cache_config)
+
+        if self.shift_model is not None:
+            # Bind the KV caches to the shift parallel model.
+            forward_context = (
+                self.vllm_config.compilation_config.static_forward_context)
+            for mod in self.shift_model.modules():
+                if isinstance(mod, Attention):
+                    mod.kv_cache = forward_context[mod.layer_name].kv_cache
+
+    def _log_execution_time(self, start_timestamp, duration_seconds, batch_size, num_scheduled_tokens, early_return=False):
+        """Log CPU execution time metrics for execute_model calls"""
+        try:
+            timing_data = {
+                "timestamp": start_timestamp,
+                "call_type": "execute_model_timing",
+                "execution_duration_seconds": duration_seconds,
+                "execution_duration_ms": duration_seconds * 1000,
+                "batch_size": batch_size,
+                "num_scheduled_tokens": num_scheduled_tokens,
+                "process_info": {
+                    "rank": int(_os.getenv("RANK", "0")),
+                    "local_rank": int(_os.getenv("LOCAL_RANK", "0")),
+                    "world_size": int(_os.getenv("WORLD_SIZE", "1"))
+                },
+                "early_return": early_return
+            }
+            
+            # Write to file
+            self._write_timing_stats(timing_data)
+            
+        except Exception as e:
+            # Log error but don't crash the model
+            logger.error(f"Failed to log execution time: {e}")
+    
+    def _write_timing_stats(self, timing_data):
+        """Buffer execution timing data and flush periodically to reduce I/O."""
+        self._cpu_timing_buffer.append(json.dumps(timing_data, default=self._json_serializable))
+        
+        # Flush conditions: buffer size or time threshold
+        should_flush_by_n = len(self._cpu_timing_buffer) >= self._timing_flush_every_n
+        should_flush_by_time = (_time.monotonic() - self._timing_last_flush_time) >= self._timing_flush_every_s
+        if should_flush_by_n or should_flush_by_time:
+            self._flush_timing_buffer()
+
+    def _flush_timing_buffer(self, force: bool = False):
+        """Flush buffered timing lines to disk.
+
+        When force is True, flush unconditionally (e.g., at exit).
+        """
+        try:
+            if not self._cpu_timing_buffer and not force:
+                return
+            # Nothing to write if empty and not forced
+            if not self._cpu_timing_buffer:
+                self._timing_last_flush_time = _time.monotonic()
+                return
+
+            # Write all pending lines at once
+            with open(self._timing_file_path_cpu, "a") as f:
+                f.write("\n".join(self._cpu_timing_buffer) + "\n")
+            self._cpu_timing_buffer.clear()
+            self._timing_last_flush_time = _time.monotonic()
+        except Exception as e:
+            logger.error(f"Failed to flush timing stats: {e}")
+
+    def _json_serializable(self, obj):
+        """Convert numpy types and other non-serializable objects to JSON-serializable types"""
+        if isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif hasattr(obj, 'item'):  # Handle scalar numpy types
+            return obj.item()
+        else:
+            return str(obj)  # Fallback to string representation

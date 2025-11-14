@@ -6,3 +6,48 @@ __pycache__
 docs/_build
 .idea
 arctic_inference/embedding/proto/python/
+
+# Environment and virtual environment directories
+env/
+venv/
+.env
+.venv
+
+# Test files and performance test data
+*test*.py
+*performance*.py
+*memory_leak*.py
+*clear_test*.py
+*minimal_test*.py
+*cache_performance*.py
+performance_summary_report.md
+
+# Compiled Python files
+*.pyc
+*.pyo
+*.pyd
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE and editor files
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp

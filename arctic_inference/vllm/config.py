@@ -57,6 +57,9 @@ class ArcticSpeculativeConfig(SpeculativeConfig):
 
     enable_suffix_decoding: bool = False
     suffix_cache_max_depth: int = 64
+    num_speculative_tokens: int = 64
+    suffix_speculative_tokens: int = 0
+    suffix_cache_max_requests: int = 100000
     suffix_max_spec_factor: float = 1.0
     suffix_max_spec_offset: float = 0.0
     suffix_min_token_prob: float = 0.1
@@ -90,15 +93,20 @@ class SpeculativeConfigPatch(ArcticPatch[SpeculativeConfig]):
         use_suffix = (self.method
                       == "suffix") or (self.method is None
                                        and self.enable_suffix_decoding)
+        use_hybrid = (self.method == "arctic"
+                      and self.enable_suffix_decoding)
         if (use_suffix or self.method == "arctic") and \
             self.disable_by_batch_size is None:
             logger.info("Defaulting disable_by_batch_size to 64")
             self.disable_by_batch_size = 64
+
+        if use_hybrid:
+            self.suffix_speculative_tokens = self.suffix_cache_max_depth
             
         if use_suffix:
             self.method = "suffix"
             self.enable_suffix_decoding = True
-            self.num_speculative_tokens = self.suffix_cache_max_depth
+            self.num_speculative_tokens = self.num_speculative_tokens
             self._verify_args()
         else:
             self._orig_post_init()
@@ -128,6 +136,6 @@ class MLPSpeculatorConfigPatch(ArcticPatch[MLPSpeculatorConfig]):
 
     _orig_init = MLPSpeculatorConfig.__init__
 
-    def __post_init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         self.base_model_arch = kwargs.pop("base_model_arch", "")
         self._orig_init(*args, **kwargs)
