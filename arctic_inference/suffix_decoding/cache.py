@@ -63,8 +63,8 @@ class SuffixDecodingCache:
     def __init__(self,
                  max_tree_depth: int = 64,
                  max_cached_requests: int = -1,
-                 thread_safe: bool = False,
-                 max_threads: int = None):
+                 thread_safe: bool = True,
+                 max_threads: int = 4):
         """
         Initialize the SuffixDecodingCache.
 
@@ -82,12 +82,7 @@ class SuffixDecodingCache:
         self._max_tree_depth = max_tree_depth
         self._max_cached_requests = max_cached_requests
         self._thread_safe = thread_safe
-        
-        # Configure thread pool size
-        if max_threads is None:
-            self._max_threads = 10
-        else:
-            self._max_threads = max_threads
+        self._max_threads = max_threads
         # Local suffix trees cache prompts for each active request separately.
         self._local_trees = {}
         
@@ -289,6 +284,9 @@ class SuffixDecodingCache:
         
         # Validate and normalize input data with assertions
         normalized_data = []
+        # 🕐 阶段2: 线程分组和负载均衡 (以problem_id为单位分配到不同线程)
+        thread_groups = [[] for _ in range(self._max_threads)]
+        
         for i, item in enumerate(problem_data):
             # Assert input format
             assert isinstance(item, dict), f"Expected dict at index {i}, got {type(item)}"
@@ -297,6 +295,8 @@ class SuffixDecodingCache:
             problem_id = item['problem_id']
             sequences = item.get('sequences', [])
             assert isinstance(sequences, list), f"'sequences' must be list at index {i}, got {type(sequences)}"
+            
+            thread_idx = i % self._max_threads
             
             for seq_idx, seq_data in enumerate(sequences):
                 assert isinstance(seq_data, dict), f"Sequence at index {i}.{seq_idx} must be dict, got {type(seq_data)}"
@@ -310,28 +310,17 @@ class SuffixDecodingCache:
                 assert isinstance(prompt_tokens, list), f"prompt_tokens must be list at {i}.{seq_idx}, got {type(prompt_tokens)}"
                 assert isinstance(response_tokens, list), f"response_tokens must be list at {i}.{seq_idx}, got {type(response_tokens)}"
                 
-                normalized_data.append((seq_id, problem_id, prompt_tokens, response_tokens))
+                thread_groups[thread_idx].append((seq_id, problem_id, prompt_tokens, response_tokens))
             
-            # If no sequences, still create an entry with empty data
-            if not sequences:
-                normalized_data.append((0, problem_id, [], []))
-        
-        # Group problems by thread using hash-based load balancing
-        thread_groups = [[] for _ in range(self._max_threads)]
-        for seq_id, problem_id, prompt_tokens, response_tokens in normalized_data:
-            problem_hash = hashlib.md5(str(problem_id).encode()).hexdigest()
-            thread_idx = int(problem_hash, 16) % self._max_threads
-            thread_groups[thread_idx].append((seq_id, problem_id, prompt_tokens, response_tokens))
-        
         def prebuild_problem_group(group_data):
             """Pre-build a group of problems in one thread"""
-            thread_start = time.perf_counter()
             built_count = 0
             
             for seq_id, problem_id, prompt_tokens, response_tokens in group_data:
                 try:
                     # Thread-safe tree creation
                     if problem_id not in self._problem_tree:
+                        # 🔧 修复: SuffixTree构造函数只接受max_depth参数，不支持thread_safe
                         self._problem_tree[problem_id] = SuffixTree(self._max_tree_depth)
                     
                     tree = self._problem_tree[problem_id]
@@ -351,11 +340,12 @@ class SuffixDecodingCache:
             
             return {
                 'built': built_count,
-                'time': time.perf_counter() - thread_start
             }
         
         # Execute parallel prebuild with ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=len([g for g in thread_groups if g])) as executor:
+        max_workers = len([g for g in thread_groups if g])
+        print(f"debug:max_workers: {max_workers}")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             for i, group in enumerate(thread_groups):
                 if group:  # Only submit non-empty groups
@@ -368,10 +358,8 @@ class SuffixDecodingCache:
                 results.append(future.result())
             
             total_built = sum(r['built'] for r in results)
-            max_thread_time = max(r['time'] for r in results) if results else 0
             
             #print(f"Parallel prebuild: {total_built} problems built in {max_thread_time:.3f}s using {len(results)} threads")
-        
         # elapsed = time.time() - start_time
         # print(f"✅ Parallel prebuild completed in {elapsed:.3f}s - {total_built}/{len(problem_data)} problems built")
         

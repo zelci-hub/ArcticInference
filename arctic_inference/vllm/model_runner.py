@@ -18,6 +18,7 @@ import copy
 import time
 import threading
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Union, Optional, TYPE_CHECKING, Hashable, List
 from itertools import tee
 import json
@@ -292,6 +293,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         # Set up speculative decoding.
         self._suffix_cache = None
+        # # Initialize persistent thread pool for suffix speculation
+        # self._speculation_threadpool = None
+        # self._speculation_max_workers = 8
+        
         if arctic_speculative_config is not None:
             # Restore the speculative config.
             self.vllm_config.speculative_config = arctic_speculative_config
@@ -306,18 +311,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                                      f"{self.speculative_config.method}")
 
                 self.rejection_sampler = RejectionSampler()
-
-        if (self.speculative_config is not None
-                and self.speculative_config.enable_suffix_decoding):
-            if self.speculative_config.method not in ("arctic", "suffix",
-                                                      "mlp_speculator"):
-                raise ValueError(
-                    "Suffix decoding is only supported with the 'arctic', "
-                    "'mlp_speculator' or 'suffix' spec decoding methods.")
-            spec_cfg = self.speculative_config
-            self._suffix_cache = SuffixDecodingCache(
-                max_tree_depth=spec_cfg.suffix_cache_max_depth,
-                max_cached_requests=spec_cfg.suffix_cache_max_requests)
 
         # Initialize CPU timing buffer and paths
         self._cpu_timing_buffer: list[str] = []
@@ -553,7 +546,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+    ) -> Union[ModelRunnerOutput, IntermediateTensors]:  
+        torch.cuda.synchronize()
+        cpu_execution_start_time = time.perf_counter()
+        cpu_execution_start_timestamp = datetime.now().isoformat()
+        batch_size = len(self.input_batch.req_ids)
+ 
+        
         self._update_states(scheduler_output)
 
         if not scheduler_output.total_num_scheduled_tokens:
@@ -646,6 +645,18 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # compiled with full CUDA graphs, we have to skip them entirely.
         skip_cuda_graphs = self.full_cuda_graph and not attention_cuda_graphs
 
+        # # Record CPU execution time after prefix padding
+        # torch.cuda.synchronize()
+        # cpu_execution_end_time = time.perf_counter()
+        # cpu_execution_duration = cpu_execution_end_time - cpu_execution_start_time
+        # self._log_execution_time(cpu_execution_start_timestamp, cpu_execution_duration, batch_size, 
+        #                         scheduler_output.total_num_scheduled_tokens, early_return=False)
+
+        # torch.cuda.synchronize()
+        # cpu_execution_start_time = time.perf_counter()
+        # cpu_execution_start_timestamp = datetime.now().isoformat()
+        # batch_size = len(self.input_batch.req_ids)
+    
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with set_forward_context(
@@ -669,12 +680,19 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
-
+        
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
         else:
             hidden_states = model_output
             aux_hidden_states = None
+                # Record CPU execution time after prefix padding
+        # torch.cuda.synchronize()
+        # cpu_execution_end_time = time.perf_counter()
+        # cpu_execution_duration = cpu_execution_end_time - cpu_execution_start_time
+        # self._log_execution_time(cpu_execution_start_timestamp, cpu_execution_duration, batch_size, 
+        #                         scheduler_output.total_num_scheduled_tokens, early_return=False)
+
 
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
@@ -767,8 +785,15 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
 
+    
         # NOTE: GPU -> CPU Sync happens here.
         # Move as many CPU operations as possible before this sync point.
+                # Start CPU execution time profiling for suffix tree decoding
+        # torch.cuda.synchronize()
+        # cpu_execution_start_time = time.perf_counter()
+        # cpu_execution_start_timestamp = datetime.now().isoformat()
+        # batch_size = len(self.input_batch.req_ids)
+    
         logprobs_tensors = sampler_output.logprobs_tensors
         logprobs_lists = logprobs_tensors.tolists() \
             if logprobs_tensors is not None else None
@@ -819,14 +844,21 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
+        # torch.cuda.synchronize()
+        # cpu_execution_start_time = time.perf_counter()
+        # cpu_execution_start_timestamp = datetime.now().isoformat()
+        # batch_size = len(self.input_batch.req_ids)
+
+
+        # 40s
         if self._suffix_cache is not None:
             self._update_suffix_cache(valid_sampled_token_ids)
 
-        # Start CPU execution time profiling for suffix tree decoding
-        torch.cuda.synchronize()
-        cpu_execution_start_time = time.perf_counter()
-        cpu_execution_start_timestamp = datetime.now().isoformat()
-        batch_size = len(self.input_batch.req_ids)
+        # # Start CPU execution time profiling for suffix tree decoding
+        # torch.cuda.synchronize()
+        # cpu_execution_start_time = time.perf_counter()
+        # cpu_execution_start_timestamp = datetime.now().isoformat()
+        # batch_size = len(self.input_batch.req_ids)
 
         if not self.speculative_config:
             # Speculative decoding is not enabled.
@@ -844,18 +876,19 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 attn_metadata,
             )
 
-        # Record CPU execution time after suffix tree decoding
+        # Clear KVConnector state after all KVs are generated.
+        if has_kv_transfer_group():
+            get_kv_transfer_group().clear_connector_metadata()
+
+        self.eplb_step()
+
+                # Record CPU execution time after suffix tree decoding
         torch.cuda.synchronize()
         cpu_execution_end_time = time.perf_counter()
         cpu_execution_duration = cpu_execution_end_time - cpu_execution_start_time
         self._log_execution_time(cpu_execution_start_timestamp, cpu_execution_duration, batch_size, 
                                 scheduler_output.total_num_scheduled_tokens, early_return=False)
 
-        # Clear KVConnector state after all KVs are generated.
-        if has_kv_transfer_group():
-            get_kv_transfer_group().clear_connector_metadata()
-
-        self.eplb_step()
 
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
@@ -1031,7 +1064,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         spec_token_ids: Optional[list[list[int]]] = None,
     ) -> list[list[int]]:
         # Start timing for overall method
-        method_start_time = _time.perf_counter()
+        # method_start_time = _time.perf_counter()
         
         config = self.speculative_config
         batch_size = len(sampled_token_ids)
@@ -1131,6 +1164,290 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
             results.append(result)
         return results
+
+    def propose_suffix_draft_token_ids_parallel(
+        self,
+        sampled_token_ids: list[list[int]],
+        spec_token_ids: Optional[list[list[int]]] = None,
+    ) -> list[SuffixDecodingDraft]:
+        """
+        Parallel version of propose_suffix_draft_token_ids using ThreadPoolExecutor.
+        
+        This implementation uses a persistent thread pool to process suffix speculation
+        requests in parallel, reducing latency for large batches.
+        """
+        config = self.speculative_config
+        batch_size = len(sampled_token_ids)
+        
+        # Determine which indices are allowed (hard and medium only)
+        try:
+            hard_indices, medium_indices, easy_indices, allowed_indices = self._get_hard_and_non_hard_indices()
+        except Exception as e:
+            print(f"Error getting hard and non-hard indices: {e}")
+            hard_indices, medium_indices, easy_indices, allowed_indices = [], [], [], []
+
+        if len(allowed_indices) > 0:
+            # Case (1): Only process hard/medium; others return empty
+            results: list[SuffixDecodingDraft] = [SuffixDecodingDraft() for _ in range(len(sampled_token_ids))]
+            # Use persistent thread pool to avoid repeated creation overhead
+            self._speculation_max_workers = 9
+            if self._speculation_threadpool is None:
+                self._speculation_threadpool = ThreadPoolExecutor(max_workers=self._speculation_max_workers)
+                print(f"[ThreadPool] Created with {self._speculation_max_workers} workers")
+            
+            # Pre-extract all data to avoid shared state access in threads
+            prepared_tasks = []
+            hard_spec, hard_prob, hard_spec_factor = 16, 0.1, 2
+            medium_spec, medium_prob, medium_spec_factor = 8, 0.1, 1
+            easy_spec, easy_prob, easy_spec_factor = 4, 0.1, 1
+            
+            # Adjust parameters based on batch size
+            if batch_size <= 64:
+                medium_spec, medium_prob, medium_spec_factor = 16, 0.1, 2
+                easy_spec, easy_prob, easy_spec_factor = 16, 0.1, 2
+            elif batch_size <= 128:
+                medium_spec, medium_prob, medium_spec_factor = 16, 0.1, 2
+                easy_spec, easy_prob, easy_spec_factor = 8, 0.1, 1
+            
+            if spec_token_ids is not None:
+                print(f"spec_token_ids length: {len(spec_token_ids)}")
+            
+            # Process hard indices
+            for i in hard_indices:
+                if 0 <= i < len(sampled_token_ids):
+                    sampled_ids = sampled_token_ids[i]
+                    spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+                    req_id = self.input_batch.req_ids[i]
+                    end_idx = self.input_batch.num_tokens_no_spec[i]
+                    if end_idx >= self.max_model_len:
+                        continue
+                    size = min(end_idx, config.suffix_cache_max_depth)
+                    pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx].tolist()
+                    problem_id = self.get_problem_id_by_request_id(req_id)
+                    
+                    # Pack everything into a self-contained tuple
+                    prepared_tasks.append((
+                        i, req_id, problem_id, pattern, spec_ids, 
+                        config, end_idx, self.max_model_len, hard_spec, hard_prob, hard_spec_factor
+                    ))
+
+            # Process medium indices
+            for i in medium_indices:
+                if 0 <= i < len(sampled_token_ids):
+                    sampled_ids = sampled_token_ids[i]
+                    spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+                    req_id = self.input_batch.req_ids[i]
+                    end_idx = self.input_batch.num_tokens_no_spec[i]
+                    if end_idx >= self.max_model_len:
+                        continue
+                    size = min(end_idx, config.suffix_cache_max_depth)
+                    pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx].tolist()
+                    problem_id = self.get_problem_id_by_request_id(req_id)
+                    prepared_tasks.append((
+                        i, req_id, problem_id, pattern, spec_ids, 
+                        config, end_idx, self.max_model_len, medium_spec, medium_prob, medium_spec_factor
+                    ))
+            
+            # Process easy indices
+            for i in easy_indices:
+                if 0 <= i < len(sampled_token_ids):
+                    sampled_ids = sampled_token_ids[i]
+                    spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+                    req_id = self.input_batch.req_ids[i]
+                    end_idx = self.input_batch.num_tokens_no_spec[i]
+                    if end_idx >= self.max_model_len:
+                        continue
+                    size = min(end_idx, config.suffix_cache_max_depth)
+                    pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx].tolist()
+                    problem_id = self.get_problem_id_by_request_id(req_id)
+                    prepared_tasks.append((
+                        i, req_id, problem_id, pattern, spec_ids, 
+                        config, end_idx, self.max_model_len, easy_spec, easy_prob, easy_spec_factor
+                    ))
+
+            if not prepared_tasks:
+                return results
+            
+            # Optimize: increase parallel granularity - combine multiple small tasks into batch processing tasks
+            # Group tasks by worker count, each worker processes a batch of tasks
+            num_workers = self._speculation_max_workers
+            task_groups = [[] for _ in range(num_workers)]
+            
+            # Distribute tasks to worker groups in round-robin fashion (load balancing)
+            for i, task_data in enumerate(prepared_tasks):
+                worker_id = i % num_workers
+                task_groups[worker_id].append(task_data)
+            
+            # Filter out empty groups
+            non_empty_groups = [group for group in task_groups if group]
+            
+            # Submit batch processing tasks
+            future_to_group = {}
+            for group in non_empty_groups:
+                future = self._speculation_threadpool.submit(self._process_task_batch_v2, group)
+                future_to_group[future] = group
+            
+            # Collect results
+            completed = 0
+            for future in future_to_group:
+                try:
+                    batch_results = future.result()  # Returns a list
+                    for task_data, result in batch_results:
+                        req_index = task_data[0]
+                        results[req_index] = result
+                        completed += 1
+                except Exception as e:
+                    print(f"[Error] processing batch: {e}")
+                    # Fallback: return empty results for all tasks in this batch
+                    group = future_to_group[future]
+                    for task_data in group:
+                        req_index = task_data[0]
+                        results[req_index] = SuffixDecodingDraft()
+            return results
+        else:
+            # Case (2): Fallback to previous implementation (process all)            
+            # Extract phase: prepare batch args
+            batch_args = []
+            for i, sampled_ids in enumerate(sampled_token_ids):
+                spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+                batch_args.append((i, sampled_ids, spec_ids, config))
+
+            # Use persistent thread pool to avoid repeated creation overhead
+            if self._speculation_threadpool is None:
+                self._speculation_threadpool = ThreadPoolExecutor(max_workers=self._speculation_max_workers)
+            
+            # Submit phase
+            future_to_index = {self._speculation_threadpool.submit(self._process_single_speculation, args): i 
+                              for i, args in enumerate(batch_args)}
+
+            results = [None] * len(batch_args)
+            for future in future_to_index:
+                index = future_to_index[future]
+                try:
+                    results[index] = future.result()
+                except Exception as e:
+                    results[index] = SuffixDecodingDraft()  # Fallback to empty result
+
+            return results
+
+    def _process_task_batch_v2(self, task_batch):
+        """
+        Optimize: batch process multiple speculation tasks, increase parallel granularity
+        
+        Each worker processes a batch of tasks, reducing thread scheduling and synchronization overhead
+        
+        Args:
+            task_batch: List of task data
+            
+        Returns:
+            [(task_data, result), ...] list
+        """
+        batch_results = []
+        
+        for task_data in task_batch:
+            # Unpack task data
+            (i, req_id, problem_id, pattern, spec_ids, config, end_idx, max_model_len, spec_len, min_token_prob, spec_factor) = task_data
+            
+            # # Prepare pattern
+            # if len(pattern) > 16:
+            #     pattern = pattern[-16:]
+            
+            pattern = pattern + spec_ids
+            if len(pattern) > config.suffix_cache_max_depth:
+                pattern = pattern[-config.suffix_cache_max_depth:]
+            
+            # Calculate parameters
+            max_spec_tokens = min(
+                config.num_speculative_tokens if config.num_speculative_tokens is not None else config.suffix_cache_max_depth,
+                MAX_SPEC_LEN - len(spec_ids),
+                config.suffix_cache_max_depth,
+                max_model_len - end_idx - 1,
+                spec_len
+            )
+            
+            max_spec_factor = spec_factor
+            max_spec_offset = config.suffix_max_spec_offset - len(spec_ids) * (max_spec_factor + 1)
+            
+            # Use the suffix cache to speculate
+            result, source = self._suffix_cache.speculate(
+                req_id,
+                pattern,
+                max_spec_tokens=max_spec_tokens,
+                max_spec_factor=max_spec_factor,
+                max_spec_offset=max_spec_offset,
+                min_token_prob=min_token_prob,
+                problem_id=problem_id,
+            )
+            
+            batch_results.append((task_data, result))
+        
+        return batch_results
+    
+    def _process_single_speculation(self, args):
+        """Process a single speculation request for parallel execution (OLD VERSION with shared state)"""
+        (i, sampled_ids, spec_ids, config) = args
+        
+        num_sampled_ids = len(sampled_ids)
+        if not num_sampled_ids:
+            # Skip speculative decoding.
+            return SuffixDecodingDraft()
+
+        req_id = self.input_batch.req_ids[i]
+        problem_id = self.get_problem_id_by_request_id(req_id)
+        if problem_id is None:
+            print(f"problem_id is None for req_id={req_id}")
+
+        # Add sampled_token_ids to token_ids_cpu.
+        end_idx = self.input_batch.num_tokens_no_spec[i]
+
+        if end_idx >= self.max_model_len:
+            return SuffixDecodingDraft()
+
+        size = min(end_idx, config.suffix_cache_max_depth)
+        pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx]
+        pattern = pattern.tolist() + spec_ids
+        if len(pattern) > config.suffix_cache_max_depth:
+            pattern = pattern[-config.suffix_cache_max_depth:]
+        max_spec_tokens = min(config.num_speculative_tokens if config.num_speculative_tokens is not None else config.suffix_cache_max_depth,
+                              MAX_SPEC_LEN - len(spec_ids),
+                              config.suffix_cache_max_depth,
+                              self.max_model_len - end_idx - 1)
+        # max_spec_offset is modified to mimic the behavior of the original
+        # max_spec_factor and max_spec_offset as if the speculative tokens
+        # were generated by suffix decoding. For example, if:
+        #   - max_spec_factor = 2
+        #   - max_spec_offset = -1
+        #   - we've already speculated 3 tokens
+        #   - and the suffix match length is 6
+        # Then:
+        #   - The match length before the already-speculated tokens is 3
+        #   - The original config allow up to 5 speculated tokens total
+        #   - Already speculated 3 tokens, so should allow 2 more tokens
+        # So the new config should map match length 6 to 2 max spec tokens.
+        max_spec_factor = config.suffix_max_spec_factor
+        max_spec_offset = (config.suffix_max_spec_offset - len(spec_ids) *
+                           (max_spec_factor + 1))
+        
+        result, source = self._suffix_cache.speculate(
+            req_id,
+            pattern,
+            max_spec_tokens=max_spec_tokens,
+            max_spec_factor=max_spec_factor,
+            max_spec_offset=max_spec_offset,
+            min_token_prob=config.suffix_min_token_prob,
+            problem_id=problem_id,
+        )
+        
+        return result
+
+    def __del__(self):
+        """Clean up thread pool when model runner is destroyed"""
+        # Shutdown the persistent thread pool
+        if hasattr(self, '_speculation_threadpool') and self._speculation_threadpool:
+            try:
+                self._speculation_threadpool.shutdown(wait=False)
+            except:
+                pass
 
     def load_model(self) -> None:
         load_shift_model = (
