@@ -125,7 +125,7 @@ def arctic_inference_plugin():
     XgrammarBackendPatch.apply_patch()
     MLPSpeculatorConfigPatch.apply_patch()
 
-    # Apply LLM patches for problem_id support (early application)
+    # # Apply LLM patches for problem_id support (early application)
     from arctic_inference.vllm.llm import apply_llm_patches
     apply_llm_patches()
 

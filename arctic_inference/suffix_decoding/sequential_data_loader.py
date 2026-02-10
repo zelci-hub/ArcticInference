@@ -34,6 +34,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 def suffix_decode(
     suffix_cache: SuffixDecodingCache,
     request_id: int,
+    problem_id: int,
     prompt: List[int],
     ground_truth_response: List[int],
     max_spec_tokens: int,
@@ -46,7 +47,7 @@ def suffix_decode(
     if not max_spec_tokens:
         max_spec_tokens = suffix_cache.max_tree_depth
 
-    suffix_cache.start_request(request_id, prompt if use_cached_prompt else [])
+    suffix_cache.start_request(request_id, problem_id=problem_id, prompt_token_ids=prompt if use_cached_prompt else [])
 
     assert isinstance(prompt, list) and isinstance(ground_truth_response, list)
 
@@ -56,13 +57,14 @@ def suffix_decode(
         text = prompt + response
 
         start_time = time.perf_counter()
-        result = suffix_cache.speculate(
+        result, source = suffix_cache.speculate(
             request_id,
             text,
             max_spec_tokens=max_spec_tokens,
             max_spec_factor=max_spec_factor,
             min_token_prob=min_token_prob,
             use_tree_spec=use_tree_spec,
+            problem_id=problem_id,
         )
         end_time = time.perf_counter()
         spec_time = end_time - start_time
@@ -91,7 +93,7 @@ def suffix_decode(
 
         # Update suffix cache
         start_time = time.perf_counter()
-        suffix_cache.add_active_response(request_id, new_tokens)
+        suffix_cache.add_active_response(request_id, problem_id=problem_id, token_ids=new_tokens)
         end_time = time.perf_counter()
         update_time = end_time - start_time
 
@@ -206,8 +208,8 @@ def prepare_data_for_simulator(df: pd.DataFrame, tokenizer_name: Optional[str] =
     
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing data"):
         # 使用input作为prompt，output作为response
-        prompts.append(row['input'])
-        responses.append(row['output'])
+        prompts.append(row['input_token_ids'])
+        responses.append(row['output_token_ids'])
     
     result_df = pd.DataFrame({
         'prompt': prompts,
@@ -227,13 +229,9 @@ def prepare_data_for_simulator(df: pd.DataFrame, tokenizer_name: Optional[str] =
     
     for _, row in tqdm(result_df.iterrows(), total=len(result_df), desc="Tokenizing"):
         try:
-            # 确保输入是字符串
-            prompt_text = str(row['prompt']) if row['prompt'] is not None else ""
-            response_text = str(row['response']) if row['response'] is not None else ""
-            
             # Tokenize并确保返回的是整数列表
-            prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
-            response_tokens = tokenizer.encode(response_text, add_special_tokens=False)
+            prompt_tokens = row['prompt']
+            response_tokens = row['response']
             
             # 验证tokenization结果
             if not isinstance(prompt_tokens, list) or not all(isinstance(t, int) for t in prompt_tokens):
@@ -292,40 +290,38 @@ def process_sequential_task(
                                                      desc="Building cache")):
         # 使用负数request_id来标识训练样本
         train_request_id = -1 - idx
-        suffix_cache.start_request(train_request_id, example["prompt"])
-        suffix_cache.add_active_response(train_request_id, example["response"])
+        suffix_cache.start_request(train_request_id, problem_id=example["problem_id"], prompt_token_ids=example["prompt"])
+        suffix_cache.add_active_response(train_request_id, problem_id=example["problem_id"], token_ids=example["response"])
         suffix_cache.stop_request(train_request_id)
         train_request_ids.append(train_request_id)
         num_cached_tokens[train_request_id] = len(example["response"])
     
-    # 缓存驱逐策略
-    if evict_fraction > 0:
-        cached_request_ids = list(suffix_cache.cached_requests)
-        num_evict = round(len(cached_request_ids) * evict_fraction)
-        if evict_strategy == "oldest":
-            evict_ids = cached_request_ids[:num_evict]
-        elif evict_strategy == "newest":
-            evict_ids = cached_request_ids[-num_evict:]
-        else:
-            assert evict_strategy == "random"
-            rng = random.Random(seed)
-            evict_ids = rng.sample(cached_request_ids, num_evict)
+    # # 缓存驱逐策略
+    # if evict_fraction > 0:
+    #     cached_request_ids = list(suffix_cache.cached_requests)
+    #     num_evict = round(len(cached_request_ids) * evict_fraction)
+    #     if evict_strategy == "oldest":
+    #         evict_ids = cached_request_ids[:num_evict]
+    #     elif evict_strategy == "newest":
+    #         evict_ids = cached_request_ids[-num_evict:]
+    #     else:
+    #         assert evict_strategy == "random"
+    #         rng = random.Random(seed)
+    #         evict_ids = rng.sample(cached_request_ids, num_evict)
         
-        for request_id in tqdm(evict_ids, desc="Evicting cached responses"):
-            suffix_cache.evict_cached_response(request_id)
+    #     for request_id in tqdm(evict_ids, desc="Evicting cached responses"):
+    #         suffix_cache.evict_cached_response(request_id)
     
     # 检查缓存完整性
-    print("Checking cache integrity...", end=" ", flush=True)
-    if ret := suffix_cache._global_tree.check_integrity():
-        raise RuntimeError(f"Cache integrity check failed: {ret}")
-    else:
-        print("OK")
+    # print("Checking cache integrity...", end=" ", flush=True)
+    # if ret := suffix_cache._global_tree.check_integrity():
+    #     raise RuntimeError(f"Cache integrity check failed: {ret}")
+    # else:
+    #     print("OK")
     
-    num_cached_tokens = {request_id: num_cached_tokens[request_id]
-                         for request_id in suffix_cache.cached_requests}
-    
-    print("Tokens in cache:", sum(num_cached_tokens.values()))
-    print("Memory estimate:", suffix_cache._global_tree.estimate_memory())
+    # # num_cached_tokens 已经在上面的循环中完全构建好了，不需要重新过滤
+    # print("Tokens in cache:", sum(num_cached_tokens.values()))
+    # print("Memory estimate:", suffix_cache._global_tree.estimate_memory())
     
     # 在测试数据上运行
     records = []
@@ -336,13 +332,14 @@ def process_sequential_task(
         results = suffix_decode(
             suffix_cache,
             idx,  # 使用索引作为request_id
-            example["prompt"],
-            example["response"],
-            max_spec_tokens,
+            problem_id=example["problem_id"],
+            prompt=example["prompt"],
+            ground_truth_response=example["response"],
+            max_spec_tokens=max_spec_tokens,
             max_spec_factor=max_spec_factor,
             min_token_prob=min_token_prob,
             use_tree_spec=use_tree_spec,
-            use_cached_prompt=use_cached_prompt,
+            use_cached_prompt=use_cached_prompt
         )
         
         for result in results:
@@ -430,7 +427,7 @@ def main():
                         help="输出CSV文件路径")
     
     # Simulator参数
-    parser.add_argument("--max-depth", type=int, default=64,
+    parser.add_argument("--max-depth", type=int, default=32,
                         help="suffix tree的最大深度")
     parser.add_argument("--max-spec-tokens", type=int, default=0,
                         help="最大推测token数量 (0表示使用max_depth)")
@@ -496,6 +493,22 @@ def main():
             print(f"Loading test data from file {test_file_idx}")
             test_data = load_sequential_files(args.data_dir, test_file_idx, 1)
             
+            # 首先从test_data中提取所有的problem_id
+            print("Extracting problem_ids from test data...")
+            test_problem_ids = set(test_data['problem_id'].unique())
+            print(f"Found {len(test_problem_ids)} unique problem_ids in test data")
+            print(f"Test problem_ids: {list(test_problem_ids)[:10]}{'...' if len(test_problem_ids) > 10 else ''}")
+            
+            # 筛选train_data，只保留与test_data中problem_id对应的数据
+            print(f"Filtering training data by problem_ids...")
+            original_train_size = len(train_data)
+            train_data = train_data[train_data['problem_id'].isin(test_problem_ids)]
+            print(f"Filtered training data: {original_train_size} -> {len(train_data)} examples")
+            
+            if len(train_data) == 0:
+                print(f"警告: 筛选后训练数据为空，跳过 start_idx={start_idx}")
+                continue
+            
             # 准备数据
             train_data = prepare_data_for_simulator(train_data, args.tokenizer)
             test_data = prepare_data_for_simulator(test_data, args.tokenizer)
@@ -542,7 +555,10 @@ def main():
                 print(task_summary.to_string())
             
         except Exception as e:
-            print(f"处理 start_idx={start_idx} 时出错: {e}")
+            import traceback
+            print(f"处理 start_idx={start_idx} 时出错: {type(e).__name__}: {e}")
+            print("完整错误信息:")
+            traceback.print_exc()
             continue
     
     if not all_records:

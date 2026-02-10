@@ -177,19 +177,24 @@ class SuffixDecodingCache:
         if req_id not in self._local_trees:
             raise ValueError(f"Request '{req_id}' is not active")
         assert problem_id is not None
+        
+        # Ensure problem tree exists (defensive programming)
+        # if problem_id not in self._problem_tree:
+        #     self._problem_tree[problem_id] = SuffixTree(self._max_tree_depth)
+        
         if isinstance(token_ids, Sequence):
             if self._thread_safe:
-                self._problem_tree[problem_id].extend_safe(0, token_ids)
+                # self._problem_tree[problem_id].extend_safe(0, token_ids)
                 self._local_trees[req_id].extend_safe(0, token_ids)
             else:
-                self._problem_tree[problem_id].extend(0, token_ids)
+                # self._problem_tree[problem_id].extend(0, token_ids)
                 self._local_trees[req_id].extend(0, token_ids)
         else:
             if self._thread_safe:
-                self._problem_tree[problem_id].append_safe(0, token_ids)
+                # self._problem_tree[problem_id].append_safe(0, token_ids)
                 self._local_trees[req_id].append_safe(0, token_ids)
             else:
-                self._problem_tree[problem_id].append(0, token_ids)
+                # self._problem_tree[problem_id].append(0, token_ids)
                 self._local_trees[req_id].append(0, token_ids)
 
     def speculate(
@@ -369,89 +374,97 @@ class SuffixDecodingCache:
             "total_problems": len(normalized_data)
         }
 
-    def clear_all_cache(self):
+    def clear_cache(self, problem_ids: Optional[Sequence[Hashable]] = None):
         """
-        Clear all cached data in the suffix cache to free up memory.
+        Clear cached problem trees. If problem_ids is given, only those trees are
+        cleared and removed; otherwise all problem trees and local trees are cleared.
         Uses parallel tree deletion with ThreadPoolExecutor.
-        
+
+        Args:
+            problem_ids: Optional sequence of problem_id to clean. Only these
+                problem trees are cleared and removed from cache. If None, clears
+                all problem trees and local trees (full cache reset).
+
         Note: Parallel cleanup has limited speedup due to:
         1. C++ clear() holds mutex during entire operation (including memory deallocation)
         2. System memory allocator may have global locks
         3. Heavy memory deallocation operations serialize at C++ level
-        
+
         For large trees (many sequences), expect ~1.4x speedup with 4 threads,
         not close to 4x like prebuild operations.
         """
-        num_problem_trees = len(self._problem_tree)
-        num_local_trees = len(self._local_trees)
-        
-        print(f"Starting parallel cleanup of {num_problem_trees} problem trees, {num_local_trees} local trees")
-        start_time = time.time()
-        
         import hashlib
-        all_trees = []
-        
-        # Collect all problem trees
-        for problem_id, tree in self._problem_tree.items():
-            all_trees.append(("problem", problem_id, tree))
-        
-        # Collect all local trees
-        for req_id, tree in self._local_trees.items():
-            all_trees.append(("local", req_id, tree))
-        
-        if all_trees:
-            # Group trees by thread using hash-based load balancing
-            # Grouped approach is better than individual tasks for heavy operations
+
+        if problem_ids is not None:
+            # Only clean the specified problem_ids that exist in cache; deduplicate so each problem_id is cleared once
+            tree_by_pid = {
+                pid: self._problem_tree[pid]
+                for pid in problem_ids
+                if pid in self._problem_tree
+            }
+            trees_to_clear = list(tree_by_pid.items())
+            clear_full_cache = False
+        else:
+            # Clean all problem trees
+            trees_to_clear = list(self._problem_tree.items())
+            clear_full_cache = True
+
+        num_to_clear = len(trees_to_clear)
+        num_local_trees = len(self._local_trees)
+
+        print(f"Starting parallel cleanup of {num_to_clear} problem trees")
+        start_time = time.time()
+
+        if trees_to_clear:
+            # Group (problem_id, tree) by thread using hash-based load balancing
             thread_groups = [[] for _ in range(self._max_threads)]
-            for tree_type, tree_id, tree in all_trees:
-                tree_hash = hashlib.md5(str(tree_id).encode()).hexdigest()
+            for problem_id, tree in trees_to_clear:
+                tree_hash = hashlib.md5(str(problem_id).encode()).hexdigest()
                 thread_idx = int(tree_hash, 16) % self._max_threads
-                thread_groups[thread_idx].append((tree_type, tree_id, tree))
-            
+                thread_groups[thread_idx].append((problem_id, tree))
+
             def cleanup_tree_group(group_data):
                 """Clear a group of trees in one thread"""
                 thread_start = time.perf_counter()
                 cleared_count = 0
-                
-                for tree_type, tree_id, tree in group_data:
-                    # Each tree's clear() releases GIL but holds C++ mutex
+                for problem_id, tree in group_data:
                     tree.clear()
                     cleared_count += 1
-                
                 return {
-                    'cleared': cleared_count,
-                    'time': time.perf_counter() - thread_start
+                    "cleared": cleared_count,
+                    "time": time.perf_counter() - thread_start,
                 }
-            
-            # Execute parallel cleanup with ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=len([g for g in thread_groups if g])) as executor:
-                futures = []
-                for i, group in enumerate(thread_groups):
-                    if group:  # Only submit non-empty groups
-                        future = executor.submit(cleanup_tree_group, group)
-                        futures.append(future)
-                
-                # Collect results
-                results = []
-                for future in as_completed(futures):
-                    results.append(future.result())
-                
-                total_cleared = sum(r['cleared'] for r in results)
-                max_thread_time = max(r['time'] for r in results) if results else 0
-                
-                print(f"Parallel tree clearing: {total_cleared} trees in {max_thread_time:.3f}s using {len(results)} threads")
-        
-        # Clear dictionaries (fast operation)
-        self._problem_tree.clear()
-        self._local_trees.clear()
-        
-        # Force GC
+
+            num_workers = len([g for g in thread_groups if g])
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [
+                    executor.submit(cleanup_tree_group, group)
+                    for group in thread_groups
+                    if group
+                ]
+                results = [f.result() for f in as_completed(futures)]
+
+            total_cleared = sum(r["cleared"] for r in results)
+            max_thread_time = max(r["time"] for r in results) if results else 0
+            print(
+                f"Parallel tree clearing: {total_cleared} trees in {max_thread_time:.3f}s "
+                f"using {len(results)} threads"
+            )
+
+            if clear_full_cache:
+                self._problem_tree.clear()
+                self._local_trees.clear()
+            else:
+                for problem_id, _ in trees_to_clear:
+                    self._problem_tree.pop(problem_id, None)
+
         gc.collect()
-        
         elapsed = time.time() - start_time
-        print(f"✅ Parallel cleanup completed in {elapsed:.3f}s - {num_problem_trees} problem trees, "
-              f"{num_local_trees} local trees")
-        return {"success": True, "elapsed": elapsed}
+        print(
+            f"✅ Parallel cleanup completed in {elapsed:.3f}s - {num_to_clear} problem trees cleared"
+            + (f", {num_local_trees} local trees" if clear_full_cache else "")
+        )
+        return {"success": True, "elapsed": elapsed, "cleared_count": num_to_clear}
 
     def get_cache_stats(self) -> dict:
         """Get cache statistics"""
@@ -462,7 +475,7 @@ class SuffixDecodingCache:
             "max_threads": self._max_threads,
             "problem_tree_count": len(self._problem_tree),
             "local_tree_count": len(self._local_trees),
-            "cached_request_count": len(self._req_to_seq_id),
+            "active_request_count": len(self._local_trees),
         }
         
         if self._thread_safe:

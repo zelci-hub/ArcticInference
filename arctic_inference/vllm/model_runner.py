@@ -732,6 +732,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        num_draft_tokens, draft_token_ids, cu_num_draft_tokens = None, None, None
         if spec_decode_metadata is None:
             sampler_output = self.sampler(
                 logits=logits,
@@ -749,6 +750,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 sampling_metadata=sampling_metadata,
             )
             bonus_token_ids = sampler_output.sampled_token_ids
+            draft_token_ids = spec_decode_metadata.draft_token_ids
+            num_draft_tokens = spec_decode_metadata.num_draft_tokens
+            cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens
 
             # Just like `bonus_logits`, `target_logits` is a new tensor with
             # separate storage from the original `logits` tensor. Therefore,
@@ -820,6 +824,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
 
+        ### profiling suffix_tree_stats: now may have bug 
+        self._log_suffix_tree_stats(num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
+
+
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         # NOTE(woosuk): As an exception, when using PP, the scheduler sends
@@ -882,7 +890,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         self.eplb_step()
 
-                # Record CPU execution time after suffix tree decoding
+        #         # Record CPU execution time after suffix tree decoding
         torch.cuda.synchronize()
         cpu_execution_end_time = time.perf_counter()
         cpu_execution_duration = cpu_execution_end_time - cpu_execution_start_time
@@ -1071,21 +1079,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         
         # Timing: Get hard/medium/easy indices
         hard_indices, medium_indices, easy_indices, allowed_indices = self._get_hard_and_non_hard_indices()
-        #print(f"hard_indices: {len(hard_indices)}, medium_indices: {len(medium_indices)}, easy_indices: {len(easy_indices)}, allowed_indices: {len(allowed_indices) }")
         
         # Define spec parameters based on problem difficulty and batch size
-        hard_spec, hard_prob, hard_spec_factor = 16, 0.1, 2
-        medium_spec, medium_prob, medium_spec_factor = 8, 0.1, 1
-        easy_spec, easy_prob, easy_spec_factor = 4, 0.1, 1
-        
-        # Adjust parameters based on batch size
-        if batch_size <= 64:
-            medium_spec, medium_prob, medium_spec_factor = 16, 0.1, 2
-            easy_spec, easy_prob, easy_spec_factor = 16, 0.1, 2
-        elif batch_size <= 128:
-            medium_spec, medium_prob, medium_spec_factor = 16, 0.1, 2
-            easy_spec, easy_prob, easy_spec_factor = 8, 0.1, 1
-        
+        hard_spec, hard_prob, hard_spec_factor = 8, 0.1, 2
+        medium_spec, medium_prob, medium_spec_factor = 3, 0.1, 1
+        current_min_prob = config.suffix_min_token_prob  # default
+        current_spec_factor = config.suffix_max_spec_factor  # default
+
         results = []
         for i, sampled_ids in enumerate(sampled_token_ids):   
             spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
@@ -1100,13 +1100,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             end_idx = self.input_batch.num_tokens_no_spec[i]
             size = min(end_idx, config.suffix_cache_max_depth)
             pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx]
+
             pattern = pattern.tolist() + spec_ids
             if len(pattern) > config.suffix_cache_max_depth:
                 pattern = pattern[-config.suffix_cache_max_depth:]
-            # Determine spec parameters based on problem difficulty
-            # current_spec_tokens = 5  # default
-            current_min_prob = config.suffix_min_token_prob  # default
-            current_spec_factor = config.suffix_max_spec_factor  # default
+
+            if end_idx >= self.max_model_len:
+                results.append(SuffixDecodingDraft())
+                continue
             
             if i in hard_indices:
                 current_spec_tokens = hard_spec
@@ -1116,13 +1117,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 current_spec_tokens = medium_spec
                 current_min_prob = medium_prob
                 current_spec_factor = medium_spec_factor
-            elif i in easy_indices:
-                current_spec_tokens = easy_spec
-                current_min_prob = easy_prob
-                current_spec_factor = easy_spec_factor
-            else:
+            elif end_idx < 4000:
                 results.append(SuffixDecodingDraft())
-                continue
+                continue 
+            if end_idx > 4000 and end_idx < 8000 and i in easy_indices:
+                current_spec_tokens, current_min_prob, current_spec_factor = medium_spec, medium_prob, medium_spec_factor
+            if end_idx > 8000 and i not in hard_indices:
+                current_spec_tokens, current_min_prob, current_spec_factor = hard_spec, hard_prob, hard_spec_factor
+
 
             
             max_spec_tokens = min(
@@ -1165,170 +1167,170 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             results.append(result)
         return results
 
-    def propose_suffix_draft_token_ids_parallel(
-        self,
-        sampled_token_ids: list[list[int]],
-        spec_token_ids: Optional[list[list[int]]] = None,
-    ) -> list[SuffixDecodingDraft]:
-        """
-        Parallel version of propose_suffix_draft_token_ids using ThreadPoolExecutor.
+    # def propose_suffix_draft_token_ids_parallel(
+    #     self,
+    #     sampled_token_ids: list[list[int]],
+    #     spec_token_ids: Optional[list[list[int]]] = None,
+    # ) -> list[SuffixDecodingDraft]:
+    #     """
+    #     Parallel version of propose_suffix_draft_token_ids using ThreadPoolExecutor.
         
-        This implementation uses a persistent thread pool to process suffix speculation
-        requests in parallel, reducing latency for large batches.
-        """
-        config = self.speculative_config
-        batch_size = len(sampled_token_ids)
+    #     This implementation uses a persistent thread pool to process suffix speculation
+    #     requests in parallel, reducing latency for large batches.
+    #     """
+    #     config = self.speculative_config
+    #     batch_size = len(sampled_token_ids)
         
-        # Determine which indices are allowed (hard and medium only)
-        try:
-            hard_indices, medium_indices, easy_indices, allowed_indices = self._get_hard_and_non_hard_indices()
-        except Exception as e:
-            print(f"Error getting hard and non-hard indices: {e}")
-            hard_indices, medium_indices, easy_indices, allowed_indices = [], [], [], []
+    #     # Determine which indices are allowed (hard and medium only)
+    #     try:
+    #         hard_indices, medium_indices, easy_indices, allowed_indices = self._get_hard_and_non_hard_indices()
+    #     except Exception as e:
+    #         print(f"Error getting hard and non-hard indices: {e}")
+    #         hard_indices, medium_indices, easy_indices, allowed_indices = [], [], [], []
 
-        if len(allowed_indices) > 0:
-            # Case (1): Only process hard/medium; others return empty
-            results: list[SuffixDecodingDraft] = [SuffixDecodingDraft() for _ in range(len(sampled_token_ids))]
-            # Use persistent thread pool to avoid repeated creation overhead
-            self._speculation_max_workers = 9
-            if self._speculation_threadpool is None:
-                self._speculation_threadpool = ThreadPoolExecutor(max_workers=self._speculation_max_workers)
-                print(f"[ThreadPool] Created with {self._speculation_max_workers} workers")
+    #     if len(allowed_indices) > 0:
+    #         # Case (1): Only process hard/medium; others return empty
+    #         results: list[SuffixDecodingDraft] = [SuffixDecodingDraft() for _ in range(len(sampled_token_ids))]
+    #         # Use persistent thread pool to avoid repeated creation overhead
+    #         self._speculation_max_workers = 9
+    #         if self._speculation_threadpool is None:
+    #             self._speculation_threadpool = ThreadPoolExecutor(max_workers=self._speculation_max_workers)
+    #             print(f"[ThreadPool] Created with {self._speculation_max_workers} workers")
             
-            # Pre-extract all data to avoid shared state access in threads
-            prepared_tasks = []
-            hard_spec, hard_prob, hard_spec_factor = 16, 0.1, 2
-            medium_spec, medium_prob, medium_spec_factor = 8, 0.1, 1
-            easy_spec, easy_prob, easy_spec_factor = 4, 0.1, 1
+    #         # Pre-extract all data to avoid shared state access in threads
+    #         prepared_tasks = []
+    #         hard_spec, hard_prob, hard_spec_factor = 16, 0.1, 2
+    #         medium_spec, medium_prob, medium_spec_factor = 8, 0.1, 1
+    #         easy_spec, easy_prob, easy_spec_factor = 4, 0.1, 1
             
-            # Adjust parameters based on batch size
-            if batch_size <= 64:
-                medium_spec, medium_prob, medium_spec_factor = 16, 0.1, 2
-                easy_spec, easy_prob, easy_spec_factor = 16, 0.1, 2
-            elif batch_size <= 128:
-                medium_spec, medium_prob, medium_spec_factor = 16, 0.1, 2
-                easy_spec, easy_prob, easy_spec_factor = 8, 0.1, 1
+    #         # Adjust parameters based on batch size
+    #         if batch_size <= 64:
+    #             medium_spec, medium_prob, medium_spec_factor = 16, 0.1, 2
+    #             easy_spec, easy_prob, easy_spec_factor = 16, 0.1, 2
+    #         elif batch_size <= 128:
+    #             medium_spec, medium_prob, medium_spec_factor = 16, 0.1, 2
+    #             easy_spec, easy_prob, easy_spec_factor = 8, 0.1, 1
             
-            if spec_token_ids is not None:
-                print(f"spec_token_ids length: {len(spec_token_ids)}")
+    #         if spec_token_ids is not None:
+    #             print(f"spec_token_ids length: {len(spec_token_ids)}")
             
-            # Process hard indices
-            for i in hard_indices:
-                if 0 <= i < len(sampled_token_ids):
-                    sampled_ids = sampled_token_ids[i]
-                    spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
-                    req_id = self.input_batch.req_ids[i]
-                    end_idx = self.input_batch.num_tokens_no_spec[i]
-                    if end_idx >= self.max_model_len:
-                        continue
-                    size = min(end_idx, config.suffix_cache_max_depth)
-                    pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx].tolist()
-                    problem_id = self.get_problem_id_by_request_id(req_id)
+    #         # Process hard indices
+    #         for i in hard_indices:
+    #             if 0 <= i < len(sampled_token_ids):
+    #                 sampled_ids = sampled_token_ids[i]
+    #                 spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+    #                 req_id = self.input_batch.req_ids[i]
+    #                 end_idx = self.input_batch.num_tokens_no_spec[i]
+    #                 if end_idx >= self.max_model_len:
+    #                     continue
+    #                 size = min(end_idx, config.suffix_cache_max_depth)
+    #                 pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx].tolist()
+    #                 problem_id = self.get_problem_id_by_request_id(req_id)
                     
-                    # Pack everything into a self-contained tuple
-                    prepared_tasks.append((
-                        i, req_id, problem_id, pattern, spec_ids, 
-                        config, end_idx, self.max_model_len, hard_spec, hard_prob, hard_spec_factor
-                    ))
+    #                 # Pack everything into a self-contained tuple
+    #                 prepared_tasks.append((
+    #                     i, req_id, problem_id, pattern, spec_ids, 
+    #                     config, end_idx, self.max_model_len, hard_spec, hard_prob, hard_spec_factor
+    #                 ))
 
-            # Process medium indices
-            for i in medium_indices:
-                if 0 <= i < len(sampled_token_ids):
-                    sampled_ids = sampled_token_ids[i]
-                    spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
-                    req_id = self.input_batch.req_ids[i]
-                    end_idx = self.input_batch.num_tokens_no_spec[i]
-                    if end_idx >= self.max_model_len:
-                        continue
-                    size = min(end_idx, config.suffix_cache_max_depth)
-                    pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx].tolist()
-                    problem_id = self.get_problem_id_by_request_id(req_id)
-                    prepared_tasks.append((
-                        i, req_id, problem_id, pattern, spec_ids, 
-                        config, end_idx, self.max_model_len, medium_spec, medium_prob, medium_spec_factor
-                    ))
+    #         # Process medium indices
+    #         for i in medium_indices:
+    #             if 0 <= i < len(sampled_token_ids):
+    #                 sampled_ids = sampled_token_ids[i]
+    #                 spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+    #                 req_id = self.input_batch.req_ids[i]
+    #                 end_idx = self.input_batch.num_tokens_no_spec[i]
+    #                 if end_idx >= self.max_model_len:
+    #                     continue
+    #                 size = min(end_idx, config.suffix_cache_max_depth)
+    #                 pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx].tolist()
+    #                 problem_id = self.get_problem_id_by_request_id(req_id)
+    #                 prepared_tasks.append((
+    #                     i, req_id, problem_id, pattern, spec_ids, 
+    #                     config, end_idx, self.max_model_len, medium_spec, medium_prob, medium_spec_factor
+    #                 ))
             
-            # Process easy indices
-            for i in easy_indices:
-                if 0 <= i < len(sampled_token_ids):
-                    sampled_ids = sampled_token_ids[i]
-                    spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
-                    req_id = self.input_batch.req_ids[i]
-                    end_idx = self.input_batch.num_tokens_no_spec[i]
-                    if end_idx >= self.max_model_len:
-                        continue
-                    size = min(end_idx, config.suffix_cache_max_depth)
-                    pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx].tolist()
-                    problem_id = self.get_problem_id_by_request_id(req_id)
-                    prepared_tasks.append((
-                        i, req_id, problem_id, pattern, spec_ids, 
-                        config, end_idx, self.max_model_len, easy_spec, easy_prob, easy_spec_factor
-                    ))
+    #         # Process easy indices
+    #         for i in easy_indices:
+    #             if 0 <= i < len(sampled_token_ids):
+    #                 sampled_ids = sampled_token_ids[i]
+    #                 spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+    #                 req_id = self.input_batch.req_ids[i]
+    #                 end_idx = self.input_batch.num_tokens_no_spec[i]
+    #                 if end_idx >= self.max_model_len:
+    #                     continue
+    #                 size = min(end_idx, config.suffix_cache_max_depth)
+    #                 pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx].tolist()
+    #                 problem_id = self.get_problem_id_by_request_id(req_id)
+    #                 prepared_tasks.append((
+    #                     i, req_id, problem_id, pattern, spec_ids, 
+    #                     config, end_idx, self.max_model_len, easy_spec, easy_prob, easy_spec_factor
+    #                 ))
 
-            if not prepared_tasks:
-                return results
+    #         if not prepared_tasks:
+    #             return results
             
-            # Optimize: increase parallel granularity - combine multiple small tasks into batch processing tasks
-            # Group tasks by worker count, each worker processes a batch of tasks
-            num_workers = self._speculation_max_workers
-            task_groups = [[] for _ in range(num_workers)]
+    #         # Optimize: increase parallel granularity - combine multiple small tasks into batch processing tasks
+    #         # Group tasks by worker count, each worker processes a batch of tasks
+    #         num_workers = self._speculation_max_workers
+    #         task_groups = [[] for _ in range(num_workers)]
             
-            # Distribute tasks to worker groups in round-robin fashion (load balancing)
-            for i, task_data in enumerate(prepared_tasks):
-                worker_id = i % num_workers
-                task_groups[worker_id].append(task_data)
+    #         # Distribute tasks to worker groups in round-robin fashion (load balancing)
+    #         for i, task_data in enumerate(prepared_tasks):
+    #             worker_id = i % num_workers
+    #             task_groups[worker_id].append(task_data)
             
-            # Filter out empty groups
-            non_empty_groups = [group for group in task_groups if group]
+    #         # Filter out empty groups
+    #         non_empty_groups = [group for group in task_groups if group]
             
-            # Submit batch processing tasks
-            future_to_group = {}
-            for group in non_empty_groups:
-                future = self._speculation_threadpool.submit(self._process_task_batch_v2, group)
-                future_to_group[future] = group
+    #         # Submit batch processing tasks
+    #         future_to_group = {}
+    #         for group in non_empty_groups:
+    #             future = self._speculation_threadpool.submit(self._process_task_batch_v2, group)
+    #             future_to_group[future] = group
             
-            # Collect results
-            completed = 0
-            for future in future_to_group:
-                try:
-                    batch_results = future.result()  # Returns a list
-                    for task_data, result in batch_results:
-                        req_index = task_data[0]
-                        results[req_index] = result
-                        completed += 1
-                except Exception as e:
-                    print(f"[Error] processing batch: {e}")
-                    # Fallback: return empty results for all tasks in this batch
-                    group = future_to_group[future]
-                    for task_data in group:
-                        req_index = task_data[0]
-                        results[req_index] = SuffixDecodingDraft()
-            return results
-        else:
-            # Case (2): Fallback to previous implementation (process all)            
-            # Extract phase: prepare batch args
-            batch_args = []
-            for i, sampled_ids in enumerate(sampled_token_ids):
-                spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
-                batch_args.append((i, sampled_ids, spec_ids, config))
+    #         # Collect results
+    #         completed = 0
+    #         for future in future_to_group:
+    #             try:
+    #                 batch_results = future.result()  # Returns a list
+    #                 for task_data, result in batch_results:
+    #                     req_index = task_data[0]
+    #                     results[req_index] = result
+    #                     completed += 1
+    #             except Exception as e:
+    #                 print(f"[Error] processing batch: {e}")
+    #                 # Fallback: return empty results for all tasks in this batch
+    #                 group = future_to_group[future]
+    #                 for task_data in group:
+    #                     req_index = task_data[0]
+    #                     results[req_index] = SuffixDecodingDraft()
+    #         return results
+    #     else:
+    #         # Case (2): Fallback to previous implementation (process all)            
+    #         # Extract phase: prepare batch args
+    #         batch_args = []
+    #         for i, sampled_ids in enumerate(sampled_token_ids):
+    #             spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+    #             batch_args.append((i, sampled_ids, spec_ids, config))
 
-            # Use persistent thread pool to avoid repeated creation overhead
-            if self._speculation_threadpool is None:
-                self._speculation_threadpool = ThreadPoolExecutor(max_workers=self._speculation_max_workers)
+    #         # Use persistent thread pool to avoid repeated creation overhead
+    #         if self._speculation_threadpool is None:
+    #             self._speculation_threadpool = ThreadPoolExecutor(max_workers=self._speculation_max_workers)
             
-            # Submit phase
-            future_to_index = {self._speculation_threadpool.submit(self._process_single_speculation, args): i 
-                              for i, args in enumerate(batch_args)}
+    #         # Submit phase
+    #         future_to_index = {self._speculation_threadpool.submit(self._process_single_speculation, args): i 
+    #                           for i, args in enumerate(batch_args)}
 
-            results = [None] * len(batch_args)
-            for future in future_to_index:
-                index = future_to_index[future]
-                try:
-                    results[index] = future.result()
-                except Exception as e:
-                    results[index] = SuffixDecodingDraft()  # Fallback to empty result
+    #         results = [None] * len(batch_args)
+    #         for future in future_to_index:
+    #             index = future_to_index[future]
+    #             try:
+    #                 results[index] = future.result()
+    #             except Exception as e:
+    #                 results[index] = SuffixDecodingDraft()  # Fallback to empty result
 
-            return results
+    #         return results
 
     def _process_task_batch_v2(self, task_batch):
         """
@@ -1640,3 +1642,120 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             return obj.item()
         else:
             return str(obj)  # Fallback to string representation
+
+    def _log_suffix_tree_stats(self, num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids):
+        """Log suffix tree decoding statistics for this execute_model call"""
+        if not hasattr(self, 'input_batch') or not self.input_batch:
+            return
+        #print(f"DEBUG: draft_token_ids={draft_token_ids},\n")
+        
+        # Count total proposed and accepted tokens for this call
+        total_proposed = 0
+        total_accepted = 0
+        per_request_stats = []
+
+        if num_draft_tokens is None:
+            # Still need to populate per_request_stats with req_id and problem_id info
+            for req_id in self.input_batch.req_ids:
+                # Get problem_id for this request
+                problem_id = None
+                if hasattr(self, '_current_batch_req_id_to_problem_id'):
+                    problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
+                
+                per_request_stats.append({
+                    "req_id": req_id,
+                    "problem_id": problem_id,
+                    "proposed": 0,
+                    "accepted": 0
+                })
+            
+            proposed_count = 0
+            accepted_count = 0
+            stats_data = {
+                "timestamp": datetime.now().isoformat(),
+                "call_type": "execute_model_suffix_tree",
+                "batch_size": len(self.input_batch.req_ids),
+                "total_proposed": total_proposed,
+                "total_accepted": total_accepted,
+                "accept_rate": total_accepted / total_proposed * 100 if total_proposed > 0 else 0,
+                "per_request_stats": per_request_stats,
+                "process_info": {
+                    "rank": int(_os.getenv("RANK", "0")),
+                    "local_rank": int(_os.getenv("LOCAL_RANK", "0")),
+                    "world_size": int(_os.getenv("WORLD_SIZE", "1"))
+                },
+            }
+            
+            # Write to file
+            self._write_suffix_tree_stats(stats_data)
+            return
+        
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            proposed_count = num_draft_tokens[i]
+            accepted_count = len(valid_sampled_token_ids[i])-1
+
+            if accepted_count < 0:
+                proposed_count = 0
+                accepted_count = 0
+
+            total_proposed += proposed_count
+            total_accepted += accepted_count
+         
+            # Get problem_id for this request
+            problem_id = None
+            if hasattr(self, '_current_batch_req_id_to_problem_id'):
+                problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
+         
+            # Record per-request stats
+            per_request_stats.append({
+                "req_id": req_id,
+                "problem_id": problem_id,
+                "proposed": proposed_count,
+                "accepted": accepted_count
+            })
+        
+        # Add debug info for first few calls
+        if hasattr(self, '_debug_call_count'):
+            self._debug_call_count += 1
+        else:
+            self._debug_call_count = 1
+            
+        # Only log if there were spec tokens proposed
+        if True:
+            stats_data = {
+                "timestamp": datetime.now().isoformat(),
+                "call_type": "execute_model_suffix_tree",
+                "batch_size": len(self.input_batch.req_ids),
+                "total_proposed": total_proposed,
+                "total_accepted": total_accepted,
+                "accept_rate": total_accepted / total_proposed * 100 if total_proposed > 0 else 0,
+                "per_request_stats": per_request_stats,
+                "process_info": {
+                    "rank": int(_os.getenv("RANK", "0")),
+                    "local_rank": int(_os.getenv("LOCAL_RANK", "0")),
+                    "world_size": int(_os.getenv("WORLD_SIZE", "1"))
+                },
+            }
+            
+            # Write to file
+            self._write_suffix_tree_stats(stats_data)
+            #print("DEBUG:len(draft_token_ids): ", len(draft_token_ids))
+            #print("DEBUG:cu_num_draft_tokens: ", len(cu_num_draft_tokens),cu_num_draft_tokens[:5])
+            
+            # Write token data to separate file
+            #self._write_token_data_to_file(draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
+   
+    def _write_suffix_tree_stats(self, stats_data):
+        """Buffer suffix-tree stats and flush periodically to reduce I/O."""
+        try:
+            # Enqueue stats data
+            self._suffix_buffer.append(json.dumps(stats_data, default=self._json_serializable))
+
+            # Flush conditions: buffer size or time threshold
+            should_flush_by_n = len(self._suffix_buffer) >= self._suffix_flush_every_n
+            should_flush_by_time = (time.monotonic() - self._suffix_last_flush_time) >= self._suffix_flush_every_s
+            if should_flush_by_n or should_flush_by_time:
+                self._flush_suffix_buffer()
+        except Exception as e:
+            # Log error but don't crash the model
+            logger.error(f"Failed to buffer suffix tree stats: {e}")

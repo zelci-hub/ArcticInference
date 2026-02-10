@@ -135,7 +135,7 @@ def main():
         tree_start = time.time()
         
         # 创建SuffixTree - C++对象构造
-        tree = SuffixTree({self.tree_depth})
+        tree = SuffixTree(self.tree_depth)
         
         # 填充数据 - 大量C++操作，这是分析重点
         for req_idx in range({self.requests_per_problem}):
