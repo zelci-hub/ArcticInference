@@ -1081,8 +1081,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         hard_indices, medium_indices, easy_indices, allowed_indices = self._get_hard_and_non_hard_indices()
         
         # Define spec parameters based on problem difficulty and batch size
-        hard_spec, hard_prob, hard_spec_factor = 8, 0.1, 2
-        medium_spec, medium_prob, medium_spec_factor = 3, 0.1, 1
+        hard_spec, hard_prob, hard_spec_factor = 16, 0.1, 2
+        medium_spec, medium_prob, medium_spec_factor = 8, 0.1, 1
         current_min_prob = config.suffix_min_token_prob  # default
         current_spec_factor = config.suffix_max_spec_factor  # default
 
